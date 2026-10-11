@@ -1,27 +1,7 @@
 import type { Metadata, Viewport } from 'next';
-import { Fraunces, Inter, JetBrains_Mono } from 'next/font/google';
-import '@/styles/globals.css';
-
-const fraunces = Fraunces({
-  subsets: ['latin'],
-  variable: '--font-fraunces',
-  display: 'swap',
-  preload: true,
-});
-
-const inter = Inter({
-  subsets: ['latin'],
-  variable: '--font-inter',
-  display: 'swap',
-  preload: true,
-});
-
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ['latin'],
-  variable: '--font-jetbrains-mono',
-  display: 'swap',
-  preload: false,
-});
+import { AdminDocument } from '@/components/admin/admin-document';
+import { adminFontClassName } from '@/lib/admin/admin-fonts';
+import '@/styles/admin.css';
 
 export const metadata: Metadata = {
   title: 'Knowledge Base Upload | Auraplex Admin',
@@ -36,15 +16,5 @@ export const viewport: Viewport = {
 };
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
-  return (
-    <html
-      lang="en"
-      suppressHydrationWarning
-      className={`${fraunces.variable} ${inter.variable} ${jetbrainsMono.variable}`}
-    >
-      <body className="bg-[color:var(--color-ink)] text-[color:var(--color-paper)]">
-        {children}
-      </body>
-    </html>
-  );
+  return <AdminDocument fontClassName={adminFontClassName}>{children}</AdminDocument>;
 }

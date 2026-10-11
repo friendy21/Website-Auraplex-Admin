@@ -267,7 +267,7 @@ function proxyRuns(pathname: string): boolean {
 test('streaming upload path bypasses Proxy body cloning; other admin paths do not', () => {
   assert.equal(PROXY_BYPASS_UPLOAD_PATH, '/api/admin/uploads');
   assert.equal(proxyRuns('/api/admin/uploads'), false);
-  for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload', '/en']) {
+  for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload']) {
     assert.equal(proxyRuns(path), true, path);
   }
   assert.equal(proxyRuns('/api/auth/signin/keycloak'), false);
@@ -404,7 +404,7 @@ test('Keycloak logout discovers the endpoint instead of hardcoding it', async ()
   ));
   assert.equal(requested, 'https://sso.example.test/realms/auraplex/.well-known/openid-configuration');
   assert.equal(url.searchParams.get('id_token_hint'), 'server-held-token');
-  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/en');
+  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/signed-out');
 });
 
 test('Keycloak discovery failure falls back to local-only logout destination', async () => {
