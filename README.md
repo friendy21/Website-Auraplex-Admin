@@ -2,7 +2,7 @@
 
 Restricted internal workspace for uploading knowledge-base source material
 (PDF, DOCX, PNG, JPG/JPEG, MP4) for Auraplex products. Staff sign in with
-Keycloak, pick a business line and a product, and upload files. Files are
+Authentik, pick a business line and a product, and upload files. Files are
 stored in MinIO; the workspace also shows each upload's processing status
 from Qdrant and lets Admins delete an upload from both systems.
 
@@ -16,7 +16,7 @@ is intentionally public so that logout has somewhere to land, and the
 
 - **Next.js 16** (App Router, standalone output) · **React 19** · **TypeScript**
 - **Tailwind CSS v4** (`styles/admin.css`)
-- **Auth.js (next-auth v5)** with **Keycloak** (OIDC)
+- **Auth.js (next-auth v5)** with **Authentik** (OIDC)
 - **MinIO** via the AWS S3 SDK · **Qdrant** REST client
 - Tests on the Node.js test runner (`node --test` through `tsx`)
 
@@ -30,7 +30,7 @@ cp .env.example .env.local   # then fill in the values
 npm run dev                  # http://localhost:3000
 ```
 
-Without Keycloak configured, `/signed-out` renders but `/admin/upload` cannot
+Without Authentik configured, `/signed-out` renders but `/admin/upload` cannot
 complete sign-in. Without MinIO configured, uploads return
 `BACKEND_NOT_CONFIGURED` (503).
 
@@ -48,7 +48,7 @@ complete sign-in. Without MinIO configured, uploads return
 | `/api/health` | public | Liveness check: `{"status":"ok","service":"auraplex-admin"}` |
 
 `/api/health` reports only that the server process is answering. It reads no
-session and does not contact Keycloak, MinIO or Qdrant.
+session and does not contact Authentik, MinIO or Qdrant.
 
 `proxy.ts` guards `/admin/*` and `/api/admin/*` **except `/api/admin/uploads`**.
 That endpoint is deliberately excluded so large request bodies are streamed
@@ -68,7 +68,7 @@ proxy.ts              Admin authentication guard
 components/admin/     Upload workspace UI and the Admin HTML document
 components/primitives/button.tsx
 lib/admin/            Domain model, product list, validation, contracts
-lib/admin/server/     Session, Keycloak, storage, Qdrant, limits, audit
+lib/admin/server/     Session, Authentik, storage, Qdrant, limits, audit
 styles/admin.css      The only stylesheet
 tests/                Automated tests
 docs/                 User guide, runtime/deployment notes, RFC, MinIO policy
@@ -93,24 +93,31 @@ can be uploaded to them; add real records only, never placeholders.
 - Qdrant `source_key`: `{bucket}/{key}`
 - Buckets: `auraplex-raw-pdf`, `auraplex-raw-image`, `auraplex-raw-video`
 
-## Keycloak requirements
+## Authentik requirements
 
-- An OIDC client for this application (`KEYCLOAK_ISSUER`, `KEYCLOAK_CLIENT_ID`,
-  `KEYCLOAK_CLIENT_SECRET`).
-- The client must issue **refresh tokens** and put **`groups` in the ID
-  token**. Access is granted by group membership only: the uploader and admin
-  groups default to `auraplex-uploader` and `auraplex-admin`
-  (`KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE`).
-- The application sends the redirect URI
-  `<AUTH_URL>/api/auth/callback/keycloak` and the post-logout redirect URI
-  `<AUTH_URL>/signed-out`. These differ from the callback and logout URLs
-  Friendy supplied; he has confirmed that those are handled by the local
-  server, so the Auth.js routes are unchanged. See the deployment document.
+- An OAuth2/OpenID provider for this application, confidential client
+  (`AUTHENTIK_ISSUER`, `AUTHENTIK_CLIENT_ID`, `AUTHENTIK_CLIENT_SECRET`). The
+  issuer is the provider's, trailing slash included:
+  `https://auth.auraplex.info/application/o/admin-upload-provider/`. Every
+  endpoint comes from its discovery document.
+- The provider must have the **`offline_access`** scope mapping, so that it
+  issues **refresh tokens**, and must put **`groups` in the ID token** (the
+  default `profile` mapping, with "Include claims in id_token" on). Access is
+  granted by group membership only: the uploader and admin groups default to
+  `auraplex-uploader` and `auraplex-admin` (`AUTHENTIK_UPLOADER_GROUP`,
+  `AUTHENTIK_ADMIN_GROUP`).
+- The redirect URI is `<AUTH_URL>/api/auth/callback/authentik` (Auth.js
+  provider id `authentik`) and the post-logout redirect URI is
+  `<AUTH_URL>/signed-out`. Sign-in starts at the public `/sign-in` route.
+- For logout to end the Authentik session too, the provider's invalidation
+  flow needs a User Logout stage.
 
 Sessions end after 30 minutes without activity and 12 hours after sign-in.
-Every session is re-verified with Keycloak once its last verification is 60
-seconds old; if Keycloak cannot be reached at that point the request is
-refused (503) rather than trusted.
+Every session is re-verified with Authentik once its last verification is 60
+seconds old; if Authentik cannot be reached at that point the request is
+refused (503) rather than trusted. See
+`docs/deployment/AURA-INT-002-authentik.md` for the move from Keycloak and the
+live checks.
 
 ## MinIO and Qdrant requirements
 
@@ -129,12 +136,13 @@ server-only and read at runtime, except the optional
 
 | Variable | Needed for |
 | --- | --- |
-| `AUTH_SECRET`, `KEYCLOAK_ISSUER`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | Required for authentication. |
-| `AUTH_URL` | Public origin of this application. Needed for Keycloak logout; set it in every environment behind an ingress. |
+| `AUTH_SECRET`, `AUTHENTIK_ISSUER`, `AUTHENTIK_CLIENT_ID`, `AUTHENTIK_CLIENT_SECRET` | Required for authentication. |
+| `AUTH_URL` | Public origin of this application. Needed for Authentik logout; set it in every environment behind an ingress. |
 | `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | Required for upload and storage. |
 | `QDRANT_URL` | Required for processing status and delete; uploads work without it. |
 | `QDRANT_API_KEY` | Conditional: only if Qdrant requires a key. |
-| `KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE`, `MINIO_REGION` | Optional; defaulted. |
+| `AUTHENTIK_UPLOADER_GROUP`, `AUTHENTIK_ADMIN_GROUP`, `MINIO_REGION` | Optional; defaulted. |
+| `ADMIN_AUTH_DEBUG_CLAIMS` | Optional. `1` logs the claim structure of each validated ID token, for verifying the Authentik provider. |
 | `ADMIN_UPLOAD_MAX_MB` | Optional. Server-enforced per-file cap, read at runtime; 1–500, default 100. Production is 300, set in the job draft. |
 | `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | Optional. Build-time UI-only ceiling; unset, the UI follows the runtime cap. In a production build it must be unset or 300. |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | Optional. Concurrent uploads per process, 1–16, default 4. |
@@ -151,8 +159,8 @@ npm run typecheck
 npm run lint
 ```
 
-The tests run against in-process fakes (a fake Keycloak, an in-process S3
-endpoint); none contacts a real Keycloak, MinIO or Qdrant.
+The tests run against in-process fakes (a fake Authentik, an in-process S3
+endpoint); none contacts a real Authentik, MinIO or Qdrant.
 
 ## Build
 
@@ -201,15 +209,15 @@ environment and secrets, and the deployment decisions still to be made.
 
 - **Confirmed by Friendy and wired** into `deploy/admin.nomad.hcl`, a draft
   of the production job: the production hostname
-  `admin-auraplex.auraplex.info` (as `AUTH_URL`), the Keycloak issuer and
+  `admin-auraplex.auraplex.info` (as `AUTH_URL`), the Authentik issuer and
   client ID, the Nomad job, service, internal port, datacenter, node, image
   and resources, as a single instance, and the production upload cap of
   300 MB (`ADMIN_UPLOAD_MAX_MB`).
 - **Confirmed but only documented:** the staging hostname
   `admin-auraplex-staging.auraplex.info`. No staging job exists.
-- **Confirmed, no application change:** the Keycloak callback and logout URLs
-  Friendy supplied are handled by the local server. The Auth.js routes stay
-  as they are.
+- **Confirmed:** the identity provider is Authentik (AURA-INT-002), with the
+  redirect URI `https://admin-auraplex.auraplex.info/api/auth/callback/authentik`
+  registered.
 
 The draft is not production-ready and must not be submitted to Nomad. Nothing
 in the file prevents Nomad from accepting it, and the health check would pass
@@ -222,16 +230,17 @@ and production deployments. No application-side decision is outstanding.
 
 Still open before a first deployment, all within that work:
 
-- Runtime secret injection. The Keycloak client secret comes from Vault
-  (`kv/auraplex/admin-upload/keycloak_client_secret`); the Nomad wiring and
-  the other secrets and service addresses are not in place.
+- Runtime secret injection. The Authentik client secret comes from the Nomad
+  variable `nomad/jobs/admin-upload`, field `keycloak_client_secret`, and must
+  be rendered as `AUTHENTIK_CLIENT_SECRET`; the deployed job's wiring is not
+  in this draft.
 - The host port and network mapping. Only the internal port, 3000, is
   confirmed.
 - Confirmation that the ingress allows request bodies of the 300 MB upload
   cap without buffering them.
 - A real Docker build and container smoke test; none has been run.
 - The end-to-end checks listed as unverified in
-  `docs/deployment/AURA-INT-001-runtime.md`: real Keycloak, MinIO, Qdrant and
+  `docs/deployment/AURA-INT-001-runtime.md`: real Authentik, MinIO, Qdrant and
   ingress behaviour have only been tested against local fakes.
 - Triage of the open `npm audit` findings
   (`docs/deployment/AURA-INT-001-dependency-review.md`).

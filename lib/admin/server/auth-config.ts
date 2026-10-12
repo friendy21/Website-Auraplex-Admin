@@ -1,17 +1,18 @@
 import type { NextAuthConfig } from 'next-auth';
-import Keycloak from 'next-auth/providers/keycloak';
-import { extractKeycloakGroups } from '@/lib/admin/server/authorization';
-import { tryGetKeycloakConfig } from '@/lib/admin/server/config';
+import type { OIDCConfig } from 'next-auth/providers';
+import { AUTH_PROVIDER_ID } from '@/lib/admin/admin-routes';
+import { extractAuthentikGroups, logIdTokenClaimShape } from '@/lib/admin/server/authorization';
+import { tryGetAuthentikConfig, type AuthentikConfig } from '@/lib/admin/server/config';
 import { authCookieConfig } from '@/lib/admin/server/auth-cookies';
 import {
-  createKeycloakRevalidator,
-  readKeycloakSessionState,
+  createAuthentikRevalidator,
+  readAuthentikSessionState,
   readSessionLineage,
   sharedRefreshSingleFlight,
-  type KeycloakRevalidationResult,
-  type KeycloakRevalidator,
+  type AuthentikRevalidationResult,
+  type AuthentikRevalidator,
   type RefreshSingleFlight,
-} from '@/lib/admin/server/keycloak-revalidation';
+} from '@/lib/admin/server/authentik-revalidation';
 import {
   currentAdminAuthScope,
   type SessionEndReason,
@@ -23,15 +24,15 @@ import {
   REVALIDATION_UNAVAILABLE_FLAG,
   applyAdminSessionPolicy,
   evaluateAdminSession,
-  isKeycloakRevalidationDue,
+  isAuthentikRevalidationDue,
 } from '@/lib/admin/server/session-policy';
 
 export interface AdminAuthConfigOptions {
   env?: NodeJS.ProcessEnv;
   /** Injectable clock for deterministic session-expiry tests. */
   now?: () => number;
-  /** Injectable Keycloak revalidation for tests; defaults to the real one. */
-  revalidator?: KeycloakRevalidator;
+  /** Injectable Authentik revalidation for tests; defaults to the real one. */
+  revalidator?: AuthentikRevalidator;
   /** Process-local refresh and response-ordering state; defaults to the shared one. */
   coordinator?: RefreshSingleFlight;
 }
@@ -48,22 +49,50 @@ function end(reason: SessionEndReason, lineage?: SessionLineage): null {
   return null;
 }
 
+/**
+ * `profile` carries Authentik's default `groups` claim (the names of the
+ * user's groups), and must reach the ID token: the provider's "Include claims
+ * in id_token" stays on. `offline_access` is what makes Authentik issue a
+ * refresh token at all, and only when the provider has the offline_access
+ * scope mapping; without one, no session can be revalidated.
+ */
+export const AUTHENTIK_SCOPES = 'openid email profile offline_access';
+
+/**
+ * Generic OIDC provider: authorization, token, userinfo and JWKS endpoints all
+ * come from the issuer's discovery document. Authentik's default for a
+ * confidential client is HTTP Basic at the token endpoint.
+ */
+export function authentikProvider(config: AuthentikConfig): OIDCConfig<Record<string, unknown>> {
+  return {
+    id: AUTH_PROVIDER_ID,
+    name: 'Authentik',
+    type: 'oidc',
+    issuer: config.issuer,
+    clientId: config.clientId,
+    clientSecret: config.clientSecret,
+    client: { token_endpoint_auth_method: 'client_secret_basic' },
+    authorization: { params: { scope: AUTHENTIK_SCOPES } },
+  };
+}
+
 export function createAdminAuthConfig({
   env = process.env,
   now = Date.now,
   revalidator,
   coordinator = sharedRefreshSingleFlight(),
 }: AdminAuthConfigOptions = {}): NextAuthConfig {
-  let keycloak: ReturnType<typeof tryGetKeycloakConfig> = null;
+  let authentik: ReturnType<typeof tryGetAuthentikConfig> = null;
   try {
-    keycloak = tryGetKeycloakConfig(env);
+    authentik = tryGetAuthentikConfig(env);
   } catch {
     // The admin API reports partial configuration as a controlled 503 before it
     // invokes Auth.js. Keeping bootstrap inert also lets local builds run safely.
   }
-  const revalidate: KeycloakRevalidator | null = revalidator ??
-    (keycloak
-      ? createKeycloakRevalidator({ config: keycloak, now, production: env.NODE_ENV === 'production', singleFlight: coordinator })
+  const debugClaims = env.ADMIN_AUTH_DEBUG_CLAIMS === '1';
+  const revalidate: AuthentikRevalidator | null = revalidator ??
+    (authentik
+      ? createAuthentikRevalidator({ config: authentik, now, production: env.NODE_ENV === 'production', singleFlight: coordinator, debugClaims })
       : null);
 
   return {
@@ -74,30 +103,41 @@ export function createAdminAuthConfig({
     // fixed 12-hour limit is enforced by applyAdminSessionPolicy via loginAt.
     session: { strategy: 'jwt', maxAge: ADMIN_SESSION_POLICY.idleTimeoutSeconds },
     cookies: authCookieConfig(env.NODE_ENV === 'production'),
-    providers: keycloak
-      ? [
-          Keycloak({
-            issuer: keycloak.issuer,
-            clientId: keycloak.clientId,
-            clientSecret: keycloak.clientSecret,
-          }),
-        ]
-      : [],
+    providers: authentik ? [authentikProvider(authentik)] : [],
     callbacks: {
+      signIn({ account, profile }) {
+        if (debugClaims) logIdTokenClaimShape('sign-in', profile);
+        // Without a refresh token the session could never be revalidated.
+        // Refused here, the browser lands on Auth.js's AccessDenied page;
+        // ended in the jwt callback instead, it would be sent straight back
+        // to Authentik, which still has an SSO session, and loop.
+        if (account?.type === 'oidc' && !account.refresh_token) {
+          console.error(JSON.stringify({
+            type: 'admin_sign_in',
+            outcome: 'rejected',
+            reason: 'no-refresh-token',
+            hint: 'add the offline_access scope mapping to the Authentik provider',
+          }));
+          return false;
+        }
+        return true;
+      },
       async jwt({ token: stored, profile, account }) {
         // The flag describes one failed read and must never carry over.
         const token: Record<string, unknown> = { ...stored };
         delete token[REVALIDATION_UNAVAILABLE_FLAG];
 
         // `account` is present only on the sign-in callback, which starts the
-        // fixed 12-hour lifetime and counts as the first Keycloak validation.
+        // fixed 12-hour lifetime and counts as the first Authentik validation.
         if (account) {
-          // Auth.js sets token.sub to its own per-login user id. The Keycloak
+          // Auth.js sets token.sub to its own per-login user id. The Authentik
           // subject is kept separately and binds every later ID token.
-          const keycloakSub = typeof profile?.sub === 'string' && profile.sub ? profile.sub : account.providerAccountId;
+          const authentikSub = typeof profile?.sub === 'string' && profile.sub ? profile.sub : account.providerAccountId;
           // Without a refresh token the session could never be revalidated.
-          if (!account.refresh_token || !keycloakSub) return null;
+          if (!account.refresh_token || !authentikSub) return null;
           const nowSeconds = Math.floor(now() / 1000);
+          // Authentik does not send refresh_expires_in; then its token
+          // endpoint alone decides when the refresh token has expired.
           const refreshExpiresIn = account.refresh_expires_in;
           // Every sign-in is a new login lineage, starting at refresh
           // generation 0, and becomes the current login of the browser
@@ -119,9 +159,9 @@ export function createAdminAuthConfig({
           return applyAdminSessionPolicy({
             ...token,
             ...lineage,
-            groups: extractKeycloakGroups(profile),
+            groups: extractAuthentikGroups(profile),
             idToken: account.id_token,
-            keycloakSub,
+            authentikSub,
             refreshToken: account.refresh_token,
             refreshExpiresAt: typeof refreshExpiresIn === 'number' && refreshExpiresIn > 0
               ? nowSeconds + Math.floor(refreshExpiresIn)
@@ -130,23 +170,23 @@ export function createAdminAuthConfig({
           }, { signIn: true, nowMs: now() });
         }
 
-        // 1. Local idle/absolute limits, before Keycloak is contacted.
+        // 1. Local idle/absolute limits, before Authentik is contacted.
         const local = evaluateAdminSession(token, now());
         if (local === 'idle-expired') return end('local-idle-expired', readSessionLineage(token) ?? undefined);
         if (local === 'absolute-expired') return end('local-absolute-expired', readSessionLineage(token) ?? undefined);
         // Sessions from before revalidation and response ordering carry no
         // timestamps, refresh state or lineage.
-        const state = local === 'valid' ? readKeycloakSessionState(token) : null;
+        const state = local === 'valid' ? readAuthentikSessionState(token) : null;
         if (!state) return end('not-revalidatable');
         const { lineage } = state;
 
         // 2. Authoritative freshness.
         let current = token;
         let refreshed = false;
-        if (isKeycloakRevalidationDue(state.lastValidatedAt, now())) {
-          let result: KeycloakRevalidationResult;
+        if (isAuthentikRevalidationDue(state.lastValidatedAt, now())) {
+          let result: AuthentikRevalidationResult;
           if (state.refreshExpiresAt !== undefined && now() / 1000 >= state.refreshExpiresAt) {
-            result = { status: 'revoked' }; // The Keycloak session has already ended.
+            result = { status: 'revoked' }; // The Authentik session has already ended.
           } else if (!revalidate) {
             result = { status: 'unavailable', reason: 'not-configured' };
           } else {
@@ -183,7 +223,7 @@ export function createAdminAuthConfig({
           };
         }
 
-        // Read the clock again: the Keycloak round trip may have crossed the
+        // Read the clock again: the Authentik round trip may have crossed the
         // 12-hour boundary. loginAt is carried over unchanged.
         const next = applyAdminSessionPolicy(current, { signIn: false, nowMs: now() });
         if (!next) {

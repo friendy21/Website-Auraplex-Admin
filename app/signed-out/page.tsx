@@ -9,7 +9,7 @@ export default function SignedOutPage() {
         </p>
         <h1 className="mt-2 font-display text-4xl font-semibold leading-[1.05]">Signed out</h1>
         {/* A plain link: signing in again starts at the protected page, which
-            sends an unauthenticated browser to Keycloak. */}
+            sends an unauthenticated browser to Authentik. */}
         <a
           href={ADMIN_HOME_PATH}
           className="mt-6 inline-flex h-12 items-center justify-center bg-[color:var(--color-signal)] px-6 font-mono text-sm uppercase tracking-wider text-[color:var(--color-ink)] hover:bg-[color:var(--color-signal-hi)]"

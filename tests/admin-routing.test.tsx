@@ -18,7 +18,7 @@ import { AdminDocument } from '../components/admin/admin-document';
 import { FileDropzone } from '../components/admin/upload-panel-parts';
 import { ADMIN_HOME_PATH, ADMIN_SIGNED_OUT_PATH } from '../lib/admin/admin-routes';
 import { doubleSubmitCsrfValidator } from '../lib/admin/server/csrf';
-import { discoverKeycloakLogoutUrl } from '../lib/admin/server/keycloak-logout';
+import { discoverAuthentikLogoutUrl } from '../lib/admin/server/authentik-logout';
 import { InMemoryUploadRateLimiter } from '../lib/admin/server/rate-limit';
 import type { AdminSessionLoader, LoadedAdminSession } from '../lib/admin/server/session';
 import { putUpload } from '../lib/admin/server/upload-service';
@@ -45,7 +45,7 @@ function redirectTarget(render: () => unknown): string {
 }
 
 const anonymous: LoadedAdminSession = { session: null, setCookies: [] };
-/** A session loader that records every call; Keycloak is never contacted. */
+/** A session loader that records every call; Authentik is never contacted. */
 function recordingLoader(loaded: LoadedAdminSession = anonymous) {
   const calls: Headers[] = [];
   const load: AdminSessionLoader = async (headers) => {
@@ -108,15 +108,16 @@ test('the signed-out page is minimal and offers a way back in', () => {
   assert.doesNotMatch(html, /<form|<script|http-equiv/);
 });
 
-test('/admin/upload stays protected: an anonymous browser is sent to Keycloak sign-in', async () => {
+test('/admin/upload stays protected: an anonymous browser is sent to Authentik sign-in', async () => {
   const { load, calls } = recordingLoader();
   const proxy = createAdminProxy(load);
 
   const page = await visit(proxy, '/admin/upload');
   assert.equal(page.status, 307);
   const location = new URL(page.headers.get('location')!);
-  assert.equal(location.pathname, '/api/auth/signin/keycloak');
-  assert.equal(location.searchParams.get('callbackUrl'), `${ORIGIN}/admin/upload`);
+  // Not /api/auth/signin/authentik: Auth.js v5 answers that GET with UnknownAction.
+  assert.equal(`${location.origin}${location.pathname}`, `${ORIGIN}/sign-in`);
+  assert.equal(location.searchParams.get('callbackUrl'), '/admin/upload');
 
   const api = await visit(proxy, '/api/admin/csrf');
   assert.equal(api.status, 401);
@@ -124,7 +125,7 @@ test('/admin/upload stays protected: an anonymous browser is sent to Keycloak si
   assert.equal(calls.length, 2, 'both protected requests read the session');
 });
 
-test('the Admin guard still fails closed when Keycloak revalidation is unavailable', async () => {
+test('the Admin guard still fails closed when Authentik revalidation is unavailable', async () => {
   const { load } = recordingLoader({ session: null, setCookies: [], revalidationUnavailable: true });
   const proxy = createAdminProxy(load);
   const page = await visit(proxy, '/admin/upload');
@@ -154,7 +155,8 @@ test('the upload API still bypasses Proxy; the other Admin paths still run it', 
   for (const path of ['/admin', '/admin/upload', '/api/admin', '/api/admin/csrf']) {
     assert.equal(proxyRuns(path), true, path);
   }
-  assert.equal(proxyRuns('/api/auth/signin/keycloak'), false);
+  assert.equal(proxyRuns('/api/auth/callback/authentik'), false);
+  assert.equal(proxyRuns('/sign-in'), false);
   assert.deepEqual(proxyConfig.matcher, [
     '/admin/:path*',
     '/api/admin',
@@ -201,20 +203,20 @@ test('the bypassed upload Route Handler still authenticates each request itself'
   assert.deepEqual(storageCalls, [], 'an anonymous upload never reaches storage');
 });
 
-test('logout no longer points at the public website: fallback and Keycloak both use /signed-out', async () => {
+test('logout no longer points at the public website: fallback and Authentik both use /signed-out', async () => {
   const action = source('app', 'admin', 'upload', 'actions.ts');
   assert.match(action, /redirect\(endSessionUrl \?\? ADMIN_SIGNED_OUT_PATH\)/);
-  for (const file of [action, source('lib', 'admin', 'server', 'keycloak-logout.ts')]) {
+  for (const file of [action, source('lib', 'admin', 'server', 'authentik-logout.ts')]) {
     assert.doesNotMatch(file, /['"`]\/en['"`/]/);
   }
 
-  const url = new URL(await discoverKeycloakLogoutUrl(
+  const url = new URL(await discoverAuthentikLogoutUrl(
     'server-held-token',
     (async () => Response.json({
-      issuer: 'https://sso.example.test/realms/auraplex',
-      end_session_endpoint: 'https://sso.example.test/realms/auraplex/protocol/openid-connect/logout',
+      issuer: 'https://sso.example.test/application/o/admin-upload/',
+      end_session_endpoint: 'https://sso.example.test/application/o/admin-upload/end-session/',
     })) as typeof fetch,
-    { issuer: 'https://sso.example.test/realms/auraplex', clientId: 'website', clientSecret: 'test-only' },
+    { issuer: 'https://sso.example.test/application/o/admin-upload/', clientId: 'website', clientSecret: 'test-only' },
     'https://admin.example.test',
   ));
   assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://admin.example.test/signed-out');

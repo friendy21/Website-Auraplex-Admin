@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { adminSignInPath } from './lib/admin/admin-routes';
 import { canUpload, identityFromSession } from './lib/admin/server/authorization';
 import {
   PROXY_IDENTITY_HEADER,
@@ -31,9 +32,7 @@ function adminGuardResponse(request: NextRequest, status: 401 | 403): NextRespon
     );
   }
   if (status === 403) return new NextResponse('Forbidden', { status: 403 });
-  const login = new URL('/api/auth/signin/keycloak', request.url);
-  login.searchParams.set('callbackUrl', new URL(pathname, request.url).toString());
-  return NextResponse.redirect(login);
+  return NextResponse.redirect(new URL(adminSignInPath(pathname), request.url));
 }
 
 function identityProviderUnavailable(pathname: string): NextResponse {
@@ -52,7 +51,7 @@ function identityProviderUnavailable(pathname: string): NextResponse {
  * 30-minute idle and 12-hour absolute limits are the exact rules the route
  * handlers apply. The re-issued cookie (activity) or its removal (expiry) is
  * attached to every admin response, including redirects and 401s. When the
- * 60-second Keycloak revalidation is due but Keycloak cannot be reached, the
+ * 60-second Authentik revalidation is due but Authentik cannot be reached, the
  * request is denied with 503 and the cookie is left untouched.
  *
  * An allowed request continues with the authenticated identity in an
@@ -71,7 +70,7 @@ export function createAdminProxy(loadSession: AdminSessionLoader = loadAdminSess
     }
     const loaded = await loadSession(request.headers);
     if (loaded.revalidationUnavailable) return identityProviderUnavailable(pathname);
-    const identity = identityFromSession(loaded.session, loaded.keycloakSub);
+    const identity = identityFromSession(loaded.session, loaded.authentikSub);
     const status = identity ? adminGuardStatus(identity.groups) : 401;
     if (!identity || status !== 200) {
       return appendSetCookies(adminGuardResponse(request, status === 200 ? 401 : status), sessionCookiesToCommit(loaded));
@@ -93,7 +92,7 @@ export default createAdminProxy();
  * Next.js tees the request body into an in-memory clone capped by
  * `proxyClientMaxBodySize` (10 MiB) and truncates the Route Handler's copy at
  * that cap. Its handlers (PUT/GET/DELETE) authenticate the session, enforce
- * Keycloak groups, CSRF, rate limits and validation themselves.
+ * Authentik groups, CSRF, rate limits and validation themselves.
  */
 export const PROXY_BYPASS_UPLOAD_PATH = '/api/admin/uploads';
 

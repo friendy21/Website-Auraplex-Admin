@@ -17,9 +17,12 @@ const exists = (...segments: string[]) => existsSync(join(ROOT, ...segments));
 
 const PRODUCTION_HOST = 'admin-auraplex.auraplex.info';
 const STAGING_HOST = 'admin-auraplex-staging.auraplex.info';
-const ISSUER = 'https://keycloak.auraplex.info/realms/auraplex';
-const CLIENT_ID = 'auraplex-admin-upload';
-const VAULT_PATH = 'kv/auraplex/admin-upload/keycloak_client_secret';
+// AURA-INT-002: Authentik. The issuer's trailing slash is part of it.
+const ISSUER = 'https://auth.auraplex.info/application/o/admin-upload-provider/';
+const CLIENT_ID = '2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN';
+// The client secret's source: a Nomad variable whose field keeps its old name.
+const SECRET_VARIABLE = 'nomad/jobs/admin-upload';
+const SECRET_FIELD = 'keycloak_client_secret';
 
 const job = read('deploy', 'admin.nomad.hcl');
 /** The job file without its comments: only what Nomad would read. */
@@ -167,8 +170,10 @@ test('the port check constrains the internal port, not the host port', () => {
 test('the Nomad job sets the confirmed non-secret environment', () => {
   const env = block(jobConfig, /\benv\s*\{/);
   assert.match(env, new RegExp(`AUTH_URL\\s*=\\s*"https://${PRODUCTION_HOST.replaceAll('.', '\\.')}"`));
-  assert.ok(env.includes(`"${ISSUER}"`));
-  assert.match(env, new RegExp(`KEYCLOAK_CLIENT_ID\\s*=\\s*"${CLIENT_ID}"`));
+  assert.match(env, new RegExp(`AUTHENTIK_ISSUER\\s*=\\s*"${ISSUER.replaceAll('.', '\\.')}"`));
+  assert.match(env, new RegExp(`AUTHENTIK_CLIENT_ID\\s*=\\s*"${CLIENT_ID}"`));
+  // The KEYCLOAK_* names are no longer read by the application.
+  assert.doesNotMatch(jobConfig, /KEYCLOAK_/);
 });
 
 test('no confirmed field is still a placeholder', () => {
@@ -214,13 +219,14 @@ test('the single-instance and host-port limits are documented as open', () => {
   assert.match(job, /TODO\(unresolved\): host port \/ network mapping/);
 });
 
-test('the Nomad job holds no secret value and does not guess the Vault wiring', () => {
-  for (const name of ['KEYCLOAK_CLIENT_SECRET', 'AUTH_SECRET', 'MINIO_SECRET_KEY', 'MINIO_ACCESS_KEY', 'QDRANT_API_KEY']) {
+test('the Nomad job holds no secret value and does not guess the secret wiring', () => {
+  for (const name of ['AUTHENTIK_CLIENT_SECRET', 'AUTH_SECRET', 'MINIO_SECRET_KEY', 'MINIO_ACCESS_KEY', 'QDRANT_API_KEY']) {
     assert.equal(jobConfig.includes(name), false, name);
   }
   assert.doesNotMatch(jobConfig, /\b(?:vault|template|nomadVar|secret)\b/i);
-  // The secret is referenced by its Vault path, in a comment, as an open item.
-  assert.ok(job.includes(VAULT_PATH));
+  // The secret is referenced by its Nomad variable and field, in a comment, as an open item.
+  assert.ok(job.includes(SECRET_VARIABLE));
+  assert.ok(job.includes(SECRET_FIELD));
   assert.match(job, /TODO\(unresolved\): runtime secret injection/);
 });
 
@@ -249,13 +255,14 @@ test('the environment template commits no value for any variable', () => {
   for (const line of assignments) assert.match(line, /^[A-Z][A-Z0-9_]*=$/, line);
 });
 
-test('the confirmed hostnames, issuer, client and secret path are documented', () => {
+test('the confirmed hostnames, issuer, client and secret source are documented', () => {
   for (const text of [deploymentDoc, envExample]) {
     assert.ok(text.includes(`https://${PRODUCTION_HOST}`));
     assert.ok(text.includes(`https://${STAGING_HOST}`));
     assert.ok(text.includes(ISSUER));
     assert.ok(text.includes(CLIENT_ID));
-    assert.ok(text.includes(VAULT_PATH));
+    assert.ok(text.includes(SECRET_VARIABLE));
+    assert.ok(text.includes(SECRET_FIELD));
   }
   assert.match(deploymentDoc, /^## D\. Confirmed deployment values$/m);
   assert.match(deploymentDoc, /^## E\. Unresolved$/m);
@@ -263,39 +270,43 @@ test('the confirmed hostnames, issuer, client and secret path are documented', (
   assert.match(deploymentDoc, /\| Production \| `admin-auraplex\.auraplex\.info` \| Consul service `admin-upload`, internal port `3000` \|/);
 });
 
-test('the callback and logout URIs are documented as settled without an application change', () => {
-  const start = deploymentDoc.indexOf('### Keycloak callback and logout URIs\n');
+test('the callback and logout URIs follow the Authentik provider id', () => {
+  const start = deploymentDoc.indexOf('### Authentik callback and logout URIs\n');
   assert.notEqual(start, -1);
   // Recorded with the confirmed values, before the list of open items.
   assert.ok(start > deploymentDoc.indexOf('## D. Confirmed deployment values'));
   assert.ok(start < deploymentDoc.indexOf('## E. Unresolved'));
   const section = deploymentDoc.slice(start, deploymentDoc.indexOf('\n## ', start + 1));
-  assert.match(section, /Friendy confirmed that the callback and\nlogout URLs he supplied are handled by the local server/);
-  assert.match(section, /Auth\.js\nroutes therefore remain unchanged/);
-  // How the local server handles them is not described, let alone invented.
-  assert.match(section, /is not part of this\n  repository and is not described here/);
+  assert.match(section, /provider id is `authentik`/);
+  assert.match(section, /\/sign-in/);
   for (const text of [deploymentDoc, job, read('README.md')]) assert.doesNotMatch(text, /\bBLOCKED\b/i);
   for (const host of [PRODUCTION_HOST, STAGING_HOST]) {
-    for (const path of ['/api/auth/callback', '/api/auth/logout', '/api/auth/callback/keycloak', '/signed-out']) {
+    for (const path of ['/api/auth/callback/authentik', '/signed-out']) {
       assert.ok(section.includes(`\`https://${host}${path}\``), `${host}${path}`);
     }
   }
+  // The Keycloak-era callback is gone from everything a deployment reads.
+  for (const text of [deploymentDoc, job, envExample, read('README.md')]) {
+    assert.doesNotMatch(text, /callback\/keycloak/);
+  }
 });
 
-test('the callback and logout routes are unchanged in the application', () => {
+test('Auth.js owns the callback; sign-in starts at /sign-in; logout returns to /signed-out', () => {
   // Auth.js still owns /api/auth/*; no hand-written callback or logout route exists.
   assert.equal(exists('app', 'api', 'auth', '[...nextauth]', 'route.ts'), true);
   assert.equal(exists('app', 'api', 'auth', 'callback'), false);
   assert.equal(exists('app', 'api', 'auth', 'logout'), false);
+  assert.equal(exists('app', 'sign-in', 'route.ts'), true);
   // Logout still returns to the signed-out page.
   assert.equal(ADMIN_SIGNED_OUT_PATH, '/signed-out');
-  const logout = read('lib', 'admin', 'server', 'keycloak-logout.ts');
+  const logout = read('lib', 'admin', 'server', 'authentik-logout.ts');
   assert.match(logout, /post_logout_redirect_uri/);
   assert.match(logout, /ADMIN_SIGNED_OUT_PATH/);
   assert.doesNotMatch(logout, /api\/auth\/logout/);
-  // Neither supplied URL is configured anywhere a deployment would read it.
+  // Neither URL supplied for the Keycloak client (a bare /api/auth/callback
+  // or /api/auth/logout) is configured anywhere a deployment would read it.
   for (const text of [jobConfig, envExample]) {
-    assert.doesNotMatch(text, /\/api\/auth\/(?:callback|logout)/);
+    assert.doesNotMatch(text, /\/api\/auth\/(?:callback|logout)(?![/\w])/);
   }
 });
 
@@ -340,16 +351,16 @@ test('the handoff section lists every environment variable and marks the secrets
   // Column 5 is "Secret". Exactly these hold credentials.
   const secrets = [...rows].filter(([, cells]) => cells[5] === '**yes**').map(([name]) => name).sort();
   assert.deepEqual(secrets, [
-    'ADMIN_TRUSTED_PROXY_SECRET', 'AUTH_SECRET', 'KEYCLOAK_CLIENT_SECRET',
+    'ADMIN_TRUSTED_PROXY_SECRET', 'AUTHENTIK_CLIENT_SECRET', 'AUTH_SECRET',
     'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'QDRANT_API_KEY',
   ]);
   for (const [name, cells] of rows) {
     if (cells[5] !== '**yes**') assert.equal(cells[5], 'no', name);
   }
-  // The only Vault location named is the confirmed one, or its parent path.
-  const vaultPaths: string[] = section.match(/kv\/[\w\/-]+/g) ?? [];
-  assert.ok(vaultPaths.includes(VAULT_PATH));
-  for (const path of vaultPaths) assert.ok(VAULT_PATH.startsWith(path), path);
+  // The client secret's source is the confirmed Nomad variable and field; no
+  // other store is named for it.
+  assert.ok(rows.get('AUTHENTIK_CLIENT_SECRET')![6].includes(`\`${SECRET_VARIABLE}\`, field \`${SECRET_FIELD}\``));
+  assert.equal(/kv\/[\w\/-]+/.test(section), false, 'no stale Vault path');
 });
 
 test('the handoff section does not present the job or the image as ready', () => {

@@ -66,6 +66,7 @@ test('the app contains only the standalone Admin routes', () => {
     'app/layout.tsx',
     'app/page.tsx',
     'app/robots.ts',
+    'app/sign-in/route.ts',
     'app/signed-out/layout.tsx',
     'app/signed-out/page.tsx',
   ]);

@@ -2,6 +2,8 @@
 
 ## Status
 
+> **Identity provider note (AURA-INT-002).** The identity provider is now Authentik, not Keycloak. Wherever this RFC says Keycloak, read the Authentik provider described in [AURA-INT-002-authentik.md](../deployment/AURA-INT-002-authentik.md): the session, revalidation, group and logout design is unchanged; the environment variables are `AUTHENTIK_*` and the callback is `/api/auth/callback/authentik`.
+
 > **Standalone Admin note.** This RFC was written when the feature lived inside the public website repository. The Admin application has since been split into this standalone repository: the public website routes, locale routing (`next-intl`), Sanity, the website catalogue and the website Nomad job are no longer part of it. Statements below about the public site describe the state at proposal time. The upload, storage, authentication and session contracts are unchanged. Products now come from `lib/admin/admin-products.ts`.
 
 Implemented on `codex/aura-int-001-admin-upload`; **pending real-environment validation** (see [Open Questions and Unverified Items](#open-questions-and-unverified-items)).
