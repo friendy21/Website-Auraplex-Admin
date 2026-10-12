@@ -5,12 +5,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import NextAuth from 'next-auth';
 import { NextRequest } from 'next/server';
-import { getURLFromRedirectError } from 'next/dist/client/components/redirect';
-import { isRedirectError } from 'next/dist/client/components/redirect-error';
-import { workAsyncStorage } from 'next/dist/server/app-render/work-async-storage.external';
-import { workUnitAsyncStorage } from 'next/dist/server/app-render/work-unit-async-storage.external';
-import { createRequestStoreForAPI } from 'next/dist/server/async-storage/request-store';
-import { createWorkStore } from 'next/dist/server/async-storage/work-store';
 
 import { ADMIN_HOME_PATH, AUTH_PROVIDER_ID, adminSignInPath, safeCallbackPath } from '../lib/admin/admin-routes';
 import { AUTHENTIK_SCOPES, authentikProvider, createAdminAuthConfig } from '../lib/admin/server/auth-config';
@@ -19,11 +13,11 @@ import { logIdTokenClaimShape } from '../lib/admin/server/authorization';
 import { getAuthentikConfig, oidcDiscoveryUrl } from '../lib/admin/server/config';
 import { createAdminSessionLoader, identityFromLoadedSession } from '../lib/admin/server/session';
 import { createFakeAuthentik, type FakeAuthentik } from './helpers/fake-authentik';
+import { ORIGIN, cookieHeader, deliverCallback, visitSignIn } from './helpers/sign-in-flow';
 
 // The sign-in entry route and the Auth.js route are run for real, with the
 // application's own Auth.js instance, against an in-process Authentik reached
 // through a stubbed fetch. Nothing leaves the process.
-const ORIGIN = 'http://admin.example.test';
 const TEST_ENV = {
   AUTH_SECRET: 'test-only-auth-secret-0123456789abcdef',
   AUTH_URL: ORIGIN,
@@ -54,51 +48,12 @@ async function provider(options: { scopeMappings?: string[] } = {}) {
   return authentik;
 }
 
-/** Cookie request header from Set-Cookie headers, skipping removals. */
-function cookieHeader(setCookies: string[]): string {
-  return setCookies
-    .filter((cookie) => !/Max-Age=0/i.test(cookie))
-    .map((cookie) => cookie.split(';', 1)[0])
-    .join('; ');
-}
-
-/** GET /sign-in as a browser without a session: where it is sent, and the cookies it gets. */
-async function visitSignIn(search: string) {
-  const { GET } = await import('../app/sign-in/route');
-  const request = new NextRequest(`${ORIGIN}/sign-in${search}`, { headers: { host: 'admin.example.test' } });
-  let setCookies: string[] = [];
-  const workStore = createWorkStore({
-    page: '/sign-in/route',
-    renderOpts: { cacheComponents: false, supportsDynamicResponse: true, experimental: { isRoutePPREnabled: false, authInterrupts: false } },
-    buildId: 'test',
-    deploymentId: '',
-    previouslyRevalidatedTags: [],
-  } as never);
-  const requestStore = createRequestStoreForAPI(
-    request,
-    { pathname: '/sign-in', search },
-    { tags: [], expirationsByCacheKind: new Map() } as never,
-    (cookies: string[]) => { setCookies = cookies; },
-    undefined,
-  );
-  try {
-    const response = await workAsyncStorage.run(workStore, () => workUnitAsyncStorage.run(requestStore, () => GET(request)));
-    return { response, location: null, setCookies };
-  } catch (error) {
-    if (!isRedirectError(error)) throw error;
-    return { response: null, location: getURLFromRedirectError(error), setCookies };
-  }
-}
-
 /** A complete login: /sign-in → Authentik → the Auth.js callback route. */
 async function login(sub: string, groups: string[], callbackUrl = ADMIN_HOME_PATH) {
   const start = await visitSignIn(`?${new URLSearchParams({ callbackUrl })}`);
   assert.ok(start.location, '/sign-in redirects');
   const backToApp = authentik.authorize(start.location, sub, groups);
-  const { GET } = await import('../app/api/auth/[...nextauth]/route');
-  const callback = await GET(new NextRequest(backToApp, {
-    headers: { host: 'admin.example.test', cookie: cookieHeader(start.setCookies) },
-  }));
+  const callback = await deliverCallback(backToApp, cookieHeader(start.setCookies));
   return { start, callback, setCookies: callback.headers.getSetCookie() };
 }
 

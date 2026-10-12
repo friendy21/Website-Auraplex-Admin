@@ -113,6 +113,7 @@ feature that needs it is used.
 | --- | --- |
 | `AUTHENTIK_UPLOADER_GROUP`, `AUTHENTIK_ADMIN_GROUP` | `auraplex-uploader`, `auraplex-admin` |
 | `ADMIN_AUTH_DEBUG_CLAIMS` | off. `1` logs the structure of each validated ID token (claim names; values of `iss`, `aud` and `groups` only). For verifying the Authentik provider. |
+| `AUTH_DEBUG` | off. `true` turns on Auth.js's own debug log, which includes request cookies and the PKCE verifier: only briefly, while diagnosing sign-in. |
 | `MINIO_REGION` | `us-east-1` |
 | `ADMIN_UPLOAD_MAX_MB` | 100 (the application fallback, used in development and testing); range 1–500. Production is confirmed as 300 and set in the job. |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | 4 per process; range 1–16 |
@@ -243,18 +244,32 @@ taken:
 
 - **Normal path.** The application finds the provider's `end_session_endpoint`
   (`<issuer>end-session/`) through OIDC discovery and sends the browser there
-  with the server-held ID token, `client_id` and
-  `post_logout_redirect_uri=<AUTH_URL>/signed-out`. Authentik then runs the
+  with `client_id` and `post_logout_redirect_uri=<AUTH_URL>/signed-out`, and
+  no `id_token_hint`: the session does not keep the ID token (see
+  [Response size](#response-size)). Authentik then runs the
   provider's invalidation flow. The Authentik SSO session ends only if that
   flow contains a User Logout stage; Authentik's default provider invalidation
   flow is expected not to, and would leave the user signed in to Authentik.
   The application does not verify which happened.
-- **Fallback path.** If discovery cannot be completed in time, or no ID token
-  is held, the application still clears the local session and sends the
+- **Fallback path.** If discovery cannot be completed in time, or the browser
+  held no session, the application still clears the local session and sends the
   browser straight to `/signed-out`. Authentik is not involved, so the SSO
   session is **not** known to have ended, and nothing should describe it as
   ended. The user may still be signed in to Authentik and to other
   applications that use it.
+
+### Response size
+
+The ingress in front of the application refuses a response whose headers
+exceed about 4 KB: the browser receives a 502 instead (measured on
+2026-10-12; nginx's default `proxy_buffer_size`). The session cookie is
+re-issued on every authenticated response, so it is kept small: it holds no ID
+token and no access token, about 1.3 KB for a user in two groups (each further
+group adds roughly 30 bytes). Callback and Admin page responses are about
+2 KB. Raising the ingress buffer (`proxy_buffer_size 16k; proxy_buffers 8
+16k;` on the APISIX route or globally) is still recommended as headroom.
+Each OIDC callback logs its response-header size and warns above 3 KB
+(`admin_auth_callback`, `headerBytes`).
 
 ### Ingress
 
@@ -596,6 +611,7 @@ a missing one shows up when the feature that needs it is used.
 | `AUTHENTIK_UPLOADER_GROUP` | Authentik group allowed to upload | no | `auraplex-uploader` | no | job `env`, only to override | nothing; the group exists |
 | `AUTHENTIK_ADMIN_GROUP` | Authentik group allowed to administer and delete | no | `auraplex-admin` | no | job `env`, only to override | nothing; the group exists |
 | `ADMIN_AUTH_DEBUG_CLAIMS` | `1` logs the structure of each validated ID token, for verifying the provider | no | unset (off) | no | job `env`, temporarily | set only while verifying AURA-INT-002, then remove |
+| `AUTH_DEBUG` | `true` turns on Auth.js's debug log (includes request cookies and the PKCE verifier) | no | unset (off) | no | job `env`, temporarily | set only while diagnosing sign-in, then remove |
 | `MINIO_ENDPOINT` | MinIO S3 endpoint URL | yes, for upload and storage | none | no | job `env`; value not supplied | provide |
 | `MINIO_ACCESS_KEY` | MinIO access key | yes, for upload and storage | none | **yes** | runtime secret injection; store not specified | provide |
 | `MINIO_SECRET_KEY` | MinIO secret key | yes, for upload and storage | none | **yes** | runtime secret injection; store not specified | provide |

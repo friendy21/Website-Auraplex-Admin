@@ -143,6 +143,7 @@ server-only and read at runtime, except the optional
 | `QDRANT_API_KEY` | Conditional: only if Qdrant requires a key. |
 | `AUTHENTIK_UPLOADER_GROUP`, `AUTHENTIK_ADMIN_GROUP`, `MINIO_REGION` | Optional; defaulted. |
 | `ADMIN_AUTH_DEBUG_CLAIMS` | Optional. `1` logs the claim structure of each validated ID token, for verifying the Authentik provider. |
+| `AUTH_DEBUG` | Optional. `true` turns on Auth.js's debug log (includes cookies and the PKCE verifier); only briefly. |
 | `ADMIN_UPLOAD_MAX_MB` | Optional. Server-enforced per-file cap, read at runtime; 1–500, default 100. Production is 300, set in the job draft. |
 | `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | Optional. Build-time UI-only ceiling; unset, the UI follows the runtime cap. In a production build it must be unset or 300. |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | Optional. Concurrent uploads per process, 1–16, default 4. |

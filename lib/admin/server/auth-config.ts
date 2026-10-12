@@ -98,6 +98,9 @@ export function createAdminAuthConfig({
   return {
     secret: env.AUTH_SECRET || undefined,
     trustHost: true,
+    // Auth.js reads no AUTH_DEBUG variable itself. Its debug output includes
+    // request cookies and the PKCE verifier: enable it only briefly.
+    debug: env.AUTH_DEBUG === 'true' || env.AUTH_DEBUG === '1',
     // maxAge is the idle timeout: every refresh re-issues the JWT and cookie
     // with a new 30-minute expiry, so an idle browser drops the cookie. The
     // fixed 12-hour limit is enforced by applyAdminSessionPolicy via loginAt.
@@ -126,6 +129,8 @@ export function createAdminAuthConfig({
         // The flag describes one failed read and must never carry over.
         const token: Record<string, unknown> = { ...stored };
         delete token[REVALIDATION_UNAVAILABLE_FLAG];
+        // Not kept (see SESSION_COOKIE_BUDGET_BYTES); dropped from any older cookie.
+        delete token.idToken;
 
         // `account` is present only on the sign-in callback, which starts the
         // fixed 12-hour lifetime and counts as the first Authentik validation.
@@ -153,14 +158,14 @@ export function createAdminAuthConfig({
           if (scope?.browserInstanceId) scope.browserInstanceBound = true;
           report({ status: 'active', lineage });
           // Auth.js passes validated ID-token claims as profile for OIDC
-          // providers. The refresh and ID tokens stay in the encrypted,
-          // HttpOnly server JWT (revalidation and RP logout); the access token
-          // is not kept.
+          // providers. Only the refresh token stays in the encrypted, HttpOnly
+          // server JWT (revalidation); neither the ID token nor the access
+          // token is kept, so the cookie stays well inside the gateway's
+          // response-header limit (see SESSION_COOKIE_BUDGET_BYTES).
           return applyAdminSessionPolicy({
             ...token,
             ...lineage,
             groups: extractAuthentikGroups(profile),
-            idToken: account.id_token,
             authentikSub,
             refreshToken: account.refresh_token,
             refreshExpiresAt: typeof refreshExpiresIn === 'number' && refreshExpiresIn > 0
@@ -215,7 +220,6 @@ export function createAdminAuthConfig({
           current = {
             ...token,
             groups: result.groups, // replaced, not merged: removed groups are gone
-            idToken: result.idToken,
             refreshToken: result.refreshToken,
             refreshExpiresAt: result.refreshExpiresAt,
             lastValidatedAt: result.validatedAt,

@@ -4,6 +4,11 @@
  * runs the provider's invalidation flow. Whether that flow also ends the
  * Authentik SSO session (a User Logout stage) is Authentik configuration, and
  * `<AUTH_URL>/signed-out` must be allowed there as the post-logout redirect.
+ *
+ * The request names the client (`client_id`) instead of carrying an
+ * `id_token_hint` (OIDC RP-Initiated Logout 1.0 §2 allows either): the ID
+ * token is not kept in the session cookie, whose size every Admin response
+ * pays for (see SESSION_COOKIE_BUDGET_BYTES).
  */
 import { ADMIN_SIGNED_OUT_PATH } from '@/lib/admin/admin-routes';
 import { getAuthentikConfig, oidcDiscoveryUrl, type AuthentikConfig } from '@/lib/admin/server/config';
@@ -16,7 +21,6 @@ export interface LogoutDiscovery {
 export function buildAuthentikLogoutUrl(input: {
   issuer: string;
   clientId: string;
-  idToken: string;
   endpoint: string;
   postLogoutRedirectUri: string;
 }): string {
@@ -30,13 +34,11 @@ export function buildAuthentikLogoutUrl(input: {
     throw new Error('Production logout must use HTTPS');
   }
   endpoint.searchParams.set('client_id', input.clientId);
-  endpoint.searchParams.set('id_token_hint', input.idToken);
   endpoint.searchParams.set('post_logout_redirect_uri', redirect.toString());
   return endpoint.toString();
 }
 
 export async function discoverAuthentikLogoutUrl(
-  idToken: string,
   fetcher: typeof fetch = fetch,
   config: AuthentikConfig = getAuthentikConfig(),
   appOrigin: string | undefined = process.env.AUTH_URL?.trim(),
@@ -54,19 +56,22 @@ export async function discoverAuthentikLogoutUrl(
   return buildAuthentikLogoutUrl({
     issuer: config.issuer,
     clientId: config.clientId,
-    idToken,
     endpoint: discovery.end_session_endpoint,
     postLogoutRedirectUri: new URL(ADMIN_SIGNED_OUT_PATH, appOrigin).toString(),
   });
 }
 
+/**
+ * Only a browser that still held a session is sent through Authentik; without
+ * one there is nothing of this application's to end there.
+ */
 export async function tryDiscoverAuthentikLogoutUrl(
-  idToken: string | undefined,
-  discover: (token: string) => Promise<string> = discoverAuthentikLogoutUrl,
+  hadSession: boolean,
+  discover: () => Promise<string> = () => discoverAuthentikLogoutUrl(),
 ): Promise<string | null> {
-  if (!idToken) return null;
+  if (!hadSession) return null;
   try {
-    return await discover(idToken);
+    return await discover();
   } catch {
     // The caller must still clear its local session. Upstream SSO logout is
     // unconfirmed when discovery is unavailable.

@@ -17,9 +17,7 @@ export async function logoutFromAuthentik(): Promise<void> {
     secret,
     cookieName: authSessionCookieName(process.env.NODE_ENV === 'production'),
   });
-  const endSessionUrl = await tryDiscoverAuthentikLogoutUrl(
-    typeof token?.idToken === 'string' ? token.idToken : undefined,
-  );
+  const endSessionUrl = await tryDiscoverAuthentikLogoutUrl(token !== null);
   // A logout submitted from a login this browser has since left (signed out,
   // or signed in again) must not remove the newer session cookie. The
   // Authentik session of the submitted login is still ended below.

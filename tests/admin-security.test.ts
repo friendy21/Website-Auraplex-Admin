@@ -372,19 +372,20 @@ test('Auth.js cookies are explicitly HttpOnly and production secure', () => {
   assert.equal(local.sessionToken.options.secure, false);
 });
 
-test('Authentik logout URL uses discovery endpoint and server-held ID token hint', () => {
+test('Authentik logout URL uses the discovered endpoint and names the client, without an ID token', () => {
   const url = new URL(buildAuthentikLogoutUrl({
     issuer: 'https://sso.example.test/application/o/admin-upload/',
     clientId: 'website',
-    idToken: 'server-only-token',
     endpoint: 'https://sso.example.test/application/o/admin-upload/end-session/',
     postLogoutRedirectUri: 'https://site.example.test/en',
   }));
-  assert.equal(url.searchParams.get('id_token_hint'), 'server-only-token');
-  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/en');
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    client_id: 'website',
+    post_logout_redirect_uri: 'https://site.example.test/en',
+  });
   assert.throws(() => buildAuthentikLogoutUrl({
     issuer: 'https://sso.example.test/application/o/admin-upload/',
-    clientId: 'website', idToken: 'x',
+    clientId: 'website',
     endpoint: 'https://evil.example.test/logout',
     postLogoutRedirectUri: 'https://site.example.test/en',
   }));
@@ -400,18 +401,17 @@ test('Authentik logout discovers the endpoint instead of hardcoding it', async (
     });
   };
   const url = new URL(await discoverAuthentikLogoutUrl(
-    'server-held-token',
     fetcher as typeof fetch,
     { issuer: 'https://sso.example.test/application/o/admin-upload/', clientId: 'website', clientSecret: 'test-only' },
     'https://site.example.test',
   ));
   assert.equal(requested, 'https://sso.example.test/application/o/admin-upload/.well-known/openid-configuration');
-  assert.equal(url.searchParams.get('id_token_hint'), 'server-held-token');
+  assert.equal(url.searchParams.get('client_id'), 'website');
   assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/signed-out');
 });
 
 test('Authentik discovery failure falls back to local-only logout destination', async () => {
-  assert.equal(await tryDiscoverAuthentikLogoutUrl(undefined), null);
-  assert.equal(await tryDiscoverAuthentikLogoutUrl('token', async () => { throw new Error('offline'); }), null);
-  assert.equal(await tryDiscoverAuthentikLogoutUrl('token', async () => 'https://sso.example.test/logout'), 'https://sso.example.test/logout');
+  assert.equal(await tryDiscoverAuthentikLogoutUrl(false, async () => 'https://sso.example.test/logout'), null, 'no session: local only');
+  assert.equal(await tryDiscoverAuthentikLogoutUrl(true, async () => { throw new Error('offline'); }), null);
+  assert.equal(await tryDiscoverAuthentikLogoutUrl(true, async () => 'https://sso.example.test/logout'), 'https://sso.example.test/logout');
 });

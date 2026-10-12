@@ -275,7 +275,7 @@ test('validated 60 seconds ago: exactly one Authentik refresh, unchanged groups 
   const token = await reissued(setCookies);
   assert.equal(token?.lastValidatedAt, sec(clock.now));
   assert.equal(token?.activeAt, sec(clock.now));
-  assert.notEqual(token?.idToken, 'previous-id-token', 'the fresh ID token replaces the old one');
+  assert.equal(token?.idToken, undefined, 'an ID token carried by an older cookie is dropped, not refreshed');
 
   const ok = await upload(load, nextCookie(setCookies)!);
   assert.equal(ok.response.status, 200);
@@ -564,7 +564,7 @@ test('the single-flight state is bounded, expires, and never reuses a failure', 
   const now = () => nowMs;
   const flight = new RefreshSingleFlight(1_000, 2);
   const ok = (id: string): AuthentikRevalidationResult =>
-    ({ status: 'ok', refreshToken: id, idToken: id, groups: [], validatedAt: 1 });
+    ({ status: 'ok', refreshToken: id, groups: [], validatedAt: 1 });
   let calls = 0;
   const run = (key: string, result: AuthentikRevalidationResult) =>
     flight.run(key, now, async () => { calls += 1; return result; });
@@ -1862,7 +1862,7 @@ test('provider tokens never appear in the browser session JSON or in logs', asyn
   assert.equal(response.status, 200);
   const body = await response.text();
   const token = await reissued(response.headers.getSetCookie());
-  const secrets = [refreshToken, token?.refreshToken, token?.idToken, AK_SUB] as string[];
+  const secrets = [refreshToken, token?.refreshToken, AK_SUB] as string[];
   assert.equal(ak.calls.token, 1);
   assert.ok(secrets.every((secret) => typeof secret === 'string' && secret.length > 0));
   for (const secret of secrets) assert.equal(body.includes(secret), false);

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { SignJWT, exportJWK, generateKeyPair, type JWTPayload } from 'jose';
 
 /**
@@ -83,7 +83,8 @@ const ALL_SCOPES = ['openid', 'email', 'profile', 'offline_access'];
 export async function createFakeAuthentik(config: FakeAuthentikConfig) {
   const endpoints = fakeAuthentikEndpoints(config.issuer);
   const scopeMappings = new Set(config.scopeMappings ?? ALL_SCOPES);
-  let key = await (initialKey ??= signingKey('test-key-1'));
+  // Authentik's key ids are 32 hex characters.
+  let key = await (initialKey ??= signingKey(createHash('sha256').update('test-key-1').digest('hex').slice(0, 32)));
   const users = new Map<string, { groups: string[]; enabled: boolean }>();
   /** Live refresh tokens and the scopes granted with them. A redeemed token is removed, as with rotation. */
   const grants = new Map<string, { sub: string; scopes: Set<string> }>();
@@ -99,8 +100,9 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
       + 'match the redirection URI used in the authorization request, or was issued to another client',
   }, 400);
 
+  /** Authentik refresh tokens are 128 random characters; the size matters for cookie and header limits. */
   function newRefreshToken(sub: string, scopes: Set<string>): string {
-    const refreshToken = `refresh-${sub}-${++serial}`;
+    const refreshToken = `${++serial}-${randomBytes(96).toString('base64url')}`.slice(0, 128);
     grants.set(refreshToken, { sub, scopes });
     return refreshToken;
   }
@@ -116,6 +118,10 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
       iat: nowSeconds,
       auth_time: nowSeconds - 60,
       acr: 'goauthentik.io/providers/oauth2/default',
+      amr: ['pwd'],
+      // Authentik adds the hashed session id and the access-token hash.
+      sid: createHash('sha256').update(`session-${sub}`).digest('hex'),
+      at_hash: createHash('sha256').update(`access-${sub}-${nowSeconds}`).digest('base64url').slice(0, 22),
       ...(nonce ? { nonce } : {}),
       ...(scopes.has('email') ? { email: `${sub}@example.test`, email_verified: true } : {}),
       ...(scopes.has('profile')
@@ -222,6 +228,8 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
         const nowSeconds = Math.floor(now() / 1000);
 
         if (form.get('grant_type') === 'authorization_code') {
+          // A server error before the code is looked up leaves it redeemable.
+          if (fake.mode === 'http-5xx') return json({ error: 'server_error' }, 503);
           const issued = codes.get(form.get('code') ?? '');
           codes.delete(form.get('code') ?? '');
           const verifier = form.get('code_verifier') ?? '';

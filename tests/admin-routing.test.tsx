@@ -211,7 +211,6 @@ test('logout no longer points at the public website: fallback and Authentik both
   }
 
   const url = new URL(await discoverAuthentikLogoutUrl(
-    'server-held-token',
     (async () => Response.json({
       issuer: 'https://sso.example.test/application/o/admin-upload/',
       end_session_endpoint: 'https://sso.example.test/application/o/admin-upload/end-session/',
@@ -220,7 +219,7 @@ test('logout no longer points at the public website: fallback and Authentik both
     'https://admin.example.test',
   ));
   assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://admin.example.test/signed-out');
-  assert.equal(url.searchParams.get('id_token_hint'), 'server-held-token');
+  assert.equal(url.searchParams.get('id_token_hint'), null);
   assert.equal(url.searchParams.get('client_id'), 'website');
 });
 
