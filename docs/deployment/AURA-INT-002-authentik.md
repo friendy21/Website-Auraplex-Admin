@@ -48,10 +48,72 @@ revalidation without an obvious error once those were fixed:
 | Issuer | Kept verbatim; discovery URL built per OIDC Discovery §4 (`lib/admin/server/config.ts`). |
 | Revalidation | Token and JWKS endpoints must be on the issuer's origin (HTTPS in production), not under its path (`authentik-revalidation.ts`, was `keycloak-revalidation.ts`). |
 | No refresh token | Sign-in is refused (Auth.js AccessDenied page) and logged as `{"type":"admin_sign_in","outcome":"rejected","reason":"no-refresh-token"}`, instead of looping. |
-| Logout | Unchanged design; discovery URL fixed (`authentik-logout.ts`, was `keycloak-logout.ts`). |
+| Logout | Unchanged design; discovery URL fixed (`authentik-logout.ts`, was `keycloak-logout.ts`). Since the follow-up below it names the client (`client_id`) instead of sending an `id_token_hint`. |
 | Claim check | `ADMIN_AUTH_DEBUG_CLAIMS=1` logs the structure of each validated ID token at sign-in and refresh (claim names; values of `iss`, `aud`, `groups` only). |
 | Names | `KEYCLOAK_*` → `AUTHENTIK_*`; `keycloakSub` → `authentikSub` in the session JWT. Sessions issued by the Keycloak build cannot be revalidated and must sign in again; none could be established anyway. |
 | Tests | The fake is `tests/helpers/fake-authentik.ts`, shaped like the live provider (per-provider issuer with `/`, shared authorize/token endpoints, RS256, no `refresh_expires_in`, the authorization-code leg with PKCE, `offline_access` mapping behaviour). |
+
+## Follow-up: `invalid_grant` at the token exchange
+
+After the first deployment, sign-in passed Authentik's authorize step and
+failed in the callback: `CallbackRouteError` / "server responded with an error
+in the response body" / `{ error: "invalid_grant", provider: "authentik" }`,
+shown as Auth.js's Configuration error.
+
+**Cause: A, the authorization code redeemed twice, because the first,
+successful callback response could not pass the ingress.**
+
+What was measured (2026-10-12):
+
+| Check | Result |
+| --- | --- |
+| Live ingress, anonymous `/admin/<path>` whose redirect echoes the path | 307 with a 3,743-byte `Location`; **502** (Cloudflare `error code: 502`) from 3,943 bytes: a response whose headers exceed about 4,096 bytes never reaches the browser |
+| Same, with a request that makes one outbound call (`/sign-in`) | the 502 comes back as fast as a normal answer: no automatic retry |
+| Production build (`next build`, `NODE_ENV=production`) against an Authentik-shaped fake, one login | one code exchange, PKCE verifier matching the challenge, identical `redirect_uri` on both legs: **B and C do not occur** |
+| Its callback response | **3,741 bytes** of headers, 2,924 of them the session cookie, 1,230 bytes of whose JSON was the stored ID token |
+| Its first `/admin/upload` response (the cookie is re-issued on every authenticated response) | **3,702 bytes** |
+| The same callback delivered a second time | `invalid_grant` → `error=Configuration`, the exact log lines reported |
+
+The real ID token adds to that (a 32-hex key id, `sid`, `at_hash`, more
+groups), which takes the callback response past the 4 KB limit: the browser
+receives a 502 for a login that succeeded, and the next delivery of the same
+callback (a reload, back/forward, a retry) presents the spent code.
+
+**Fix**
+
+- The session no longer stores the ID token (it was used only as the logout
+  `id_token_hint`; logout now sends `client_id` and `post_logout_redirect_uri`,
+  as OIDC RP-Initiated Logout allows). On the production build the callback
+  response is now **2,077 bytes** and the first Admin page **2,038 bytes**;
+  each further group adds about 30 bytes.
+- A callback delivered again with the same code and the same browser's PKCE
+  cookie, while the first is in flight or up to 5 minutes after it succeeded,
+  gets the first response (`lib/admin/server/oidc-callback.ts`): the code is
+  redeemed once. The PKCE cookie is HttpOnly and per browser, so the callback
+  URL alone obtains nothing. Failures are not kept.
+- Every sign-in start and callback is logged (no code, verifier or token):
+
+  ```json
+  {"type":"admin_auth_sign_in","challenge":"<first 12 of code_challenge>","cfRay":"…"}
+  {"type":"admin_auth_callback","code":"<digest>","delivery":"first|concurrent|replayed|unkeyed","pkceCookies":1,"verifierChallenge":"<first 12>","status":302,"outcome":"session","headerBytes":2077,"ms":180,"cfRay":"…"}
+  ```
+
+  `verifierChallenge` equal to the sign-in `challenge` rules out B; the same
+  `code` digest twice with different `cfRay` values shows a re-delivery (A);
+  `headerBytes` above 3,072 is logged as a warning.
+- `AUTH_DEBUG=true` now really turns on Auth.js's debug log (Auth.js reads no
+  such variable itself). It prints cookies and the PKCE verifier: only briefly.
+
+**Confirming on the live system** (one login is enough):
+
+- The app log shows `admin_auth_sign_in` and `admin_auth_callback` with
+  `outcome` `session`, and no `CallbackRouteError`.
+- For the failures before this fix, the APISIX error log should contain
+  `upstream sent too big header while reading response header from upstream`
+  for `/api/auth/callback/authentik`, and Authentik's server log `Code does
+  not exist` (a redeemed code) rather than `Code challenge not matching` (B).
+- Recommended for ops regardless: `proxy_buffer_size 16k; proxy_buffers 8 16k;`
+  on the ingress, as headroom.
 
 ## Deployment: environment of the deployed job
 

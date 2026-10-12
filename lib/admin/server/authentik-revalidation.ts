@@ -57,7 +57,6 @@ export type AuthentikRevalidationResult =
       status: 'ok';
       /** The rotated refresh token Authentik issued in exchange for the old one. */
       refreshToken: string;
-      idToken: string;
       /** Replaces the cached groups; never merged with them. */
       groups: string[];
       /** Epoch seconds. */
@@ -450,7 +449,6 @@ export function createAuthentikRevalidator({
       return {
         status: 'ok',
         refreshToken: rotatedRefreshToken,
-        idToken,
         groups: extractAuthentikGroups(claims),
         validatedAt,
         refreshExpiresAt: refreshExpiresIn === null ? undefined : validatedAt + Math.floor(refreshExpiresIn),

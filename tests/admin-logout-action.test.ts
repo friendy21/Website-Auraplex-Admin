@@ -116,12 +116,13 @@ async function submitLogout(cookieHeader: string) {
   return { redirectedTo, response, sessionCookies: setCookies.filter((cookie) => isSessionCookie(cookie, COOKIE)) };
 }
 
-function assertAuthentikLogoutRedirect(redirectedTo: string, idToken: string) {
+// The ID token is not kept in the session, so the request names the client
+// instead of carrying an id_token_hint.
+function assertAuthentikLogoutRedirect(redirectedTo: string) {
   const url = new URL(redirectedTo);
   assert.equal(`${url.origin}${url.pathname}`, END_SESSION_ENDPOINT);
   assert.deepEqual(Object.fromEntries(url.searchParams), {
     client_id: TEST_ENV.AUTHENTIK_CLIENT_ID,
-    id_token_hint: idToken,
     post_logout_redirect_uri: 'http://admin.example.test/signed-out',
   });
 }
@@ -145,7 +146,7 @@ test('logout action, current login: the session is cleared, the login retired, a
   browser.receive(response);
   assert.equal(browser.signedIn, false);
   assert.equal(coordinator.isCurrentLogin(login.lineage), false, 'the login is retired for this browser');
-  assertAuthentikLogoutRedirect(redirectedTo, login.idToken);
+  assertAuthentikLogoutRedirect(redirectedTo);
   assert.equal(
     response.headers.getSetCookie().some((cookie) => cookie.startsWith(browserInstanceCookieName(false))),
     false,
@@ -185,7 +186,7 @@ test('logout action, delayed old login: it does not clear the newer login of the
   assert.equal(coordinator.isCurrentLogin(newLogin.lineage), true, 'the newer login is not retired');
   assert.equal((await sessionIdentity(browser.cookie))?.userId, AK_SUB, 'the newer login is still accepted');
   // Unchanged: the redirect still ends the Authentik session of the login that was submitted.
-  assertAuthentikLogoutRedirect(redirectedTo, oldLogin.idToken);
+  assertAuthentikLogoutRedirect(redirectedTo);
 
   // The newer login's own logout works as usual afterwards.
   const current = await submitLogout(browser.cookie);
@@ -193,7 +194,7 @@ test('logout action, delayed old login: it does not clear the newer login of the
   browser.receive(current.response);
   assert.equal(browser.signedIn, false);
   assert.equal(coordinator.isCurrentLogin(newLogin.lineage), false);
-  assertAuthentikLogoutRedirect(current.redirectedTo, newLogin.idToken);
+  assertAuthentikLogoutRedirect(current.redirectedTo);
 
   assert.ok(authentik.requests.every((url) => url === DISCOVERY_URL), 'only logout discovery left the process');
 });

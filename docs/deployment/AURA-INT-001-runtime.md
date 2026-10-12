@@ -4,7 +4,9 @@
 > say Keycloak, the behaviour is unchanged but the provider is Authentik: the
 > fake is `tests/helpers/fake-authentik.ts`, the modules are
 > `authentik-revalidation.ts` and `authentik-logout.ts`, and sign-in starts at
-> `/sign-in`. Provider requirements and the live checks are in
+> `/sign-in`. Since the AURA-INT-002 follow-up the session no longer keeps the
+> ID token, so logout names the client (`client_id`) instead of sending an
+> `id_token_hint`. Provider requirements and the live checks are in
 > [AURA-INT-002-authentik.md](AURA-INT-002-authentik.md).
 
 ## Verified locally versus production

@@ -1,8 +1,10 @@
+import { redirect } from 'next/navigation';
 import type { NextRequest } from 'next/server';
 import { signIn } from '@/auth';
 import { AUTH_PROVIDER_ID, safeCallbackPath } from '@/lib/admin/admin-routes';
 import { getAuthentikConfig } from '@/lib/admin/server/config';
 import { assertAdminNodeRuntime } from '@/lib/admin/server/node-runtime';
+import { logSignInStart } from '@/lib/admin/server/oidc-callback';
 
 /**
  * Starts the Authentik sign-in for a browser that Proxy or the admin page
@@ -19,7 +21,12 @@ export async function GET(request: NextRequest): Promise<Response> {
   } catch {
     return new Response('Authentication is not configured', { status: 503, headers: { 'Cache-Control': 'no-store' } });
   }
-  // Throws Next's redirect; it does not return.
-  await signIn(AUTH_PROVIDER_ID, { redirectTo: safeCallbackPath(request.nextUrl.searchParams.get('callbackUrl')) });
-  throw new Error('signIn() did not redirect');
+  // signIn() sets the PKCE cookie either way; the redirect is made here so the
+  // challenge it sends can be logged for comparison with the callback.
+  const location: string = await signIn(AUTH_PROVIDER_ID, {
+    redirectTo: safeCallbackPath(request.nextUrl.searchParams.get('callbackUrl')),
+    redirect: false,
+  });
+  logSignInStart(request, location);
+  redirect(location);
 }
