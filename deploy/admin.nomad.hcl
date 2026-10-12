@@ -104,7 +104,9 @@ job "admin-upload" {
         AUTH_URL            = "https://admin-auraplex.auraplex.info"
         # The trailing slash is part of Authentik's issuer.
         AUTHENTIK_ISSUER    = "https://auth.auraplex.info/application/o/admin-upload-provider/"
-        AUTHENTIK_CLIENT_ID = "2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN"
+        # The OAuth client ID is public (it is in every authorization URL);
+        # gitleaks flags it only for its entropy.
+        AUTHENTIK_CLIENT_ID = "2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN" # gitleaks:allow
 
         # Upload size, confirmed: the production cap is 300 MB.
         # ADMIN_UPLOAD_MAX_MB is the server-enforced RUNTIME cap (range

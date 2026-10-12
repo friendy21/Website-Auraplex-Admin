@@ -1,0 +1,7 @@
+# Reviewed false positives only, one fingerprint each, with the reason.
+#
+# AURA-INT-002: the public OAuth client ID of the Authentik provider
+# (generic-api-key matched it for its entropy). It is not a credential; the
+# client secret is never in this repository. The line now carries an inline
+# gitleaks:allow, so this entry only covers the commit that introduced it.
+e9aa05843b295166ad37a7d1b712e78696683c6f:deploy/admin.nomad.hcl:generic-api-key:107
