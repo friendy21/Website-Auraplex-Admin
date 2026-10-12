@@ -1,7 +1,7 @@
 /**
  * Browser-instance identifier (AURA-INT-001). An opaque random id kept in its
  * own cookie so that successive logins from one browser profile can be told
- * apart from logins on another browser or device, even for the same Keycloak
+ * apart from logins on another browser or device, even for the same Authentik
  * user. The sign-in callback binds each new login to it; the process-local
  * coordinator then knows which login is current for that browser, and a
  * response that belongs to an earlier login leaves the session cookie alone
@@ -12,7 +12,7 @@
  * survives sign-out on purpose, and is never logged.
  */
 import { authSessionCookieName } from '@/lib/admin/server/auth-cookies';
-import { sharedRefreshSingleFlight } from '@/lib/admin/server/keycloak-revalidation';
+import { sharedRefreshSingleFlight } from '@/lib/admin/server/authentik-revalidation';
 import { isSessionCookie, mustWithholdSessionCookies, type SessionOrdering } from '@/lib/admin/server/session';
 import { runInAdminAuthScope, type AdminAuthScope } from '@/lib/admin/server/session-context';
 

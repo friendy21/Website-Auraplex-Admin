@@ -1,0 +1,118 @@
+# AURA-INT-002 — Admin upload: Keycloak → Authentik
+
+The identity provider is Authentik 2026.2.3 at `https://auth.auraplex.info`.
+The session design is unchanged: the 30-minute idle and 12-hour absolute
+limits, the 60-second refresh-token revalidation with mandatory rotation,
+group-based authorization in Proxy and in every handler, and RP-initiated
+logout. Only the identity-provider wiring changed.
+
+## Why sign-in failed on the first deployment
+
+The staging error `[auth][error] UnknownAction: Unsupported action … at
+Object.signin` had two causes, and fixing only the first would not have
+removed it:
+
+1. **Provider id.** The app registered the Auth.js provider `keycloak`, so it
+   would have sent `redirect_uri=…/api/auth/callback/keycloak`, while the
+   Authentik provider has `…/api/auth/callback/authentik` registered.
+2. **GET sign-in.** Proxy and the admin page sent the browser to
+   `GET /api/auth/signin/<provider>`. Auth.js v5 (`@auth/core` 0.41.3) answers
+   that GET with `UnknownAction("Unsupported action")` for **every** provider
+   id, configured or not (`lib/pages/index.js`, `render.signin`); a provider
+   sign-in must be a POST with the CSRF token or the server-side `signIn()`.
+   `tests/admin-sign-in.test.ts` reproduces the error with `authentik`
+   configured.
+
+Three further incompatibilities would each have stopped sign-in or
+revalidation without an obvious error once those were fixed:
+
+3. **Issuer trailing slash.** Authentik's issuer ends in `/`. The config
+   loader stripped it, and both oauth4webapi (sign-in) and the revalidator
+   compare the issuer exactly.
+4. **Token endpoint outside the issuer path.** Authentik serves one token
+   endpoint for all providers (`/application/o/token/`). The revalidator only
+   accepted endpoints under the issuer path, so every 60-second revalidation
+   would have been a 503.
+5. **No refresh token without `offline_access`.** Authentik issues a refresh
+   token only when `offline_access` is requested **and** the provider has that
+   scope mapping. The app did not request it; without a refresh token the
+   sign-in callback ended the session, and the browser would have been sent
+   back to Authentik in a redirect loop.
+
+## What changed in the application (approach A: names renamed)
+
+| Area | Change |
+| --- | --- |
+| Provider | Generic OIDC provider, id `authentik`, everything from `<issuer>.well-known/openid-configuration`; `client_secret_basic`; scopes `openid email profile offline_access` (`lib/admin/server/auth-config.ts`). |
+| Sign-in entry | New public route `/sign-in` (`app/sign-in/route.ts`) calls the server-side `signIn('authentik')`. Proxy and the admin page redirect there with a same-origin `callbackUrl`. |
+| Issuer | Kept verbatim; discovery URL built per OIDC Discovery §4 (`lib/admin/server/config.ts`). |
+| Revalidation | Token and JWKS endpoints must be on the issuer's origin (HTTPS in production), not under its path (`authentik-revalidation.ts`, was `keycloak-revalidation.ts`). |
+| No refresh token | Sign-in is refused (Auth.js AccessDenied page) and logged as `{"type":"admin_sign_in","outcome":"rejected","reason":"no-refresh-token"}`, instead of looping. |
+| Logout | Unchanged design; discovery URL fixed (`authentik-logout.ts`, was `keycloak-logout.ts`). |
+| Claim check | `ADMIN_AUTH_DEBUG_CLAIMS=1` logs the structure of each validated ID token at sign-in and refresh (claim names; values of `iss`, `aud`, `groups` only). |
+| Names | `KEYCLOAK_*` → `AUTHENTIK_*`; `keycloakSub` → `authentikSub` in the session JWT. Sessions issued by the Keycloak build cannot be revalidated and must sign in again; none could be established anyway. |
+| Tests | The fake is `tests/helpers/fake-authentik.ts`, shaped like the live provider (per-provider issuer with `/`, shared authorize/token endpoints, RS256, no `refresh_expires_in`, the authorization-code leg with PKCE, `offline_access` mapping behaviour). |
+
+## Deployment: environment of the deployed job
+
+| Before | After | Value |
+| --- | --- | --- |
+| `KEYCLOAK_ISSUER` | `AUTHENTIK_ISSUER` | `https://auth.auraplex.info/application/o/admin-upload-provider/` (with the trailing slash) |
+| `KEYCLOAK_CLIENT_ID` | `AUTHENTIK_CLIENT_ID` | `2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN` |
+| `KEYCLOAK_CLIENT_SECRET` | `AUTHENTIK_CLIENT_SECRET` | Nomad variable `nomad/jobs/admin-upload`, field `keycloak_client_secret` (field name unchanged) |
+| `KEYCLOAK_UPLOADER_ROLE` | `AUTHENTIK_UPLOADER_GROUP` | unset (default `auraplex-uploader`) |
+| `KEYCLOAK_ADMIN_ROLE` | `AUTHENTIK_ADMIN_GROUP` | unset (default `auraplex-admin`) |
+| — | `ADMIN_AUTH_DEBUG_CLAIMS` | `1` only while running the checks below, then remove |
+
+The old names are not read. With only them in place nobody can sign in:
+`/sign-in` answers 503 "Authentication is not configured", and the upload API
+answers 503 `BACKEND_NOT_CONFIGURED` naming the missing `AUTHENTIK_*`
+variables. `/api/health` stays green either way.
+
+## Authentik provider: required settings
+
+| Setting | Required | State on 2026-10-12 |
+| --- | --- | --- |
+| Redirect URI (strict) | `https://admin-auraplex.auraplex.info/api/auth/callback/authentik` | Accepted: an authorization request from the real `/sign-in` route was answered with a redirect to `default-authentication-flow`, not an error. |
+| Scope mappings | `openid`, `email`, `profile`, **`offline_access`** | **Probably missing `offline_access`**: the discovery document's `scopes_supported` lists only `openid`, `email`, `profile`. Add "authentik default OAuth Mapping: OpenID 'offline_access'" to the provider. |
+| Include claims in id_token | on | Not visible from outside; check 3 below confirms it. |
+| Signing key | RS256 | Present: one RS256 key in the JWKS. |
+| Client authentication | `client_secret_basic` | Supported per discovery. |
+| Post-logout redirect | `https://admin-auraplex.auraplex.info/signed-out` accepted | Not visible from outside; check 6. |
+| Invalidation flow | contains a User Logout stage (for example `default-invalidation-flow`) | Not visible from outside; check 6. Authentik's default provider invalidation flow is expected not to end the Authentik session. |
+| Application binding | group bindings for `auraplex-uploader` and `auraplex-admin`, policy engine mode ANY | Confirmed in the ticket. |
+
+## Live checks (acceptance)
+
+None of these has been run: they need the client secret and real user
+accounts, which this change did not use. Use three test users: **U** in
+`auraplex-uploader` only, **A** in `auraplex-admin`, **N** in neither. Set
+`ADMIN_AUTH_DEBUG_CLAIMS=1` on the job for checks 1 to 5.
+
+| # | Check | Expected |
+| --- | --- | --- |
+| 1 | Anonymous `GET /admin/upload` | 307 to `/sign-in?callbackUrl=%2Fadmin%2Fupload`, then to `https://auth.auraplex.info/application/o/authorize/`. No `UnknownAction` in the app log. |
+| 2 | Sign in as **U** | Back on `/admin/upload`, upload workspace open, no Delete. Upload a small PDF: succeeds. If instead the Auth.js "Access Denied" page appears and the log has `no-refresh-token`, the `offline_access` mapping is missing. |
+| 3 | Find the `admin_id_token_claims` line with `"source":"sign-in"` for **U** | `iss` is the issuer above, `aud` the client ID, `groups` contains `auraplex-uploader`. Paste it into the PR (template below). |
+| 4 | Sign in as **A**; delete the upload from check 2 | Delete is offered and succeeds. **N**: Authentik's binding refuses the login; if it ever lets **N** through, every Admin page answers 403 / Not Found and every Admin API 403. |
+| 5a | While **U** is signed in, remove **U** from `auraplex-uploader` in Authentik; wait 60 s; reload | 403 (or a new sign-in, if Authentik refuses the refresh). A `"source":"refresh"` claims line without the group, or none if refused. |
+| 5b | Sign **U** in again (group restored); deactivate **U** in Authentik; wait 60 s; reload | The session ends: pages redirect to `/sign-in`, APIs answer 401. Authentik's login then refuses **U**. |
+| 6 | Sign out with the top-right button | The browser passes through `…/application/o/admin-upload-provider/end-session/` and lands on `/signed-out`. Then open `https://auth.auraplex.info/`: it must ask for a login. If it shows the user still signed in, the invalidation flow lacks a User Logout stage. |
+| 7 | Remove `ADMIN_AUTH_DEBUG_CLAIMS` | No more `admin_id_token_claims` lines. |
+
+### Claim structure for the PR
+
+The log line already contains no token, subject or e-mail; paste it as is:
+
+```json
+{"type":"admin_id_token_claims","source":"sign-in","claims":{
+  "acr":"<string>","amr":"<array(1)>","aud":"2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN",
+  "auth_time":"<number>","email":"<string>","email_verified":"<boolean>","exp":"<number>",
+  "given_name":"<string>","groups":["auraplex-uploader"],"iat":"<number>",
+  "iss":"https://auth.auraplex.info/application/o/admin-upload-provider/",
+  "name":"<string>","nickname":"<string>","preferred_username":"<string>","sub":"<string>"}}
+```
+
+The block above shows the expected shape only. The claims besides `iss`, `aud`
+and `groups` depend on the provider's mappings; what matters is that `groups`
+is present, is named `groups`, and lists the group names.

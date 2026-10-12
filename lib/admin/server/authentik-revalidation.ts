@@ -1,28 +1,29 @@
 /**
- * Authoritative Keycloak revalidation (AURA-INT-001). When a session's last
- * validation is older than KEYCLOAK_REVALIDATION_WINDOW_SECONDS, the Auth.js
- * `jwt` callback calls this module to redeem the stored refresh token, verify
- * the fresh ID token and take its groups. This is the only place that talks to
- * Keycloak's token endpoint; Proxy, the route handlers and the admin page all
- * reach it through the same session read (see session.ts).
+ * Authoritative Authentik revalidation (AURA-INT-001, Authentik since
+ * AURA-INT-002). When a session's last validation is older than
+ * AUTHENTIK_REVALIDATION_WINDOW_SECONDS, the Auth.js `jwt` callback calls this
+ * module to redeem the stored refresh token, verify the fresh ID token and
+ * take its groups. This is the only place that talks to Authentik's token
+ * endpoint; Proxy, the route handlers and the admin page all reach it through
+ * the same session read (see session.ts).
  *
  * Nothing here logs or returns a token to callers other than the `jwt`
  * callback, which keeps it inside the encrypted session JWT.
  */
 import { createHash } from 'node:crypto';
 import { createLocalJWKSet, errors as joseErrors, jwtVerify, type JSONWebKeySet } from 'jose';
-import { extractKeycloakGroups } from '@/lib/admin/server/authorization';
-import type { KeycloakConfig } from '@/lib/admin/server/config';
+import { extractAuthentikGroups, logIdTokenClaimShape } from '@/lib/admin/server/authorization';
+import { oidcDiscoveryUrl, type AuthentikConfig } from '@/lib/admin/server/config';
 import { ADMIN_SESSION_POLICY } from '@/lib/admin/server/session-policy';
 import type { SessionLineage } from '@/lib/admin/server/session-context';
 
 /** One budget for discovery, JWKS and the token request together. */
-export const KEYCLOAK_REVALIDATION_TIMEOUT_MS = 5_000;
+export const AUTHENTIK_REVALIDATION_TIMEOUT_MS = 5_000;
 /** How long discovery metadata and signing keys are cached in this process. */
 const PROVIDER_METADATA_TTL_MS = 10 * 60_000;
 /**
  * How long a successful refresh stays reusable for requests that still carry
- * the previous cookie. Keycloak rotates the refresh token on use, so a second
+ * the previous cookie. Authentik rotates the refresh token on use, so a second
  * redemption of the old one would fail; this covers the route handler that
  * runs after Proxy in the same request, and parallel browser requests sent
  * before the new Set-Cookie was applied.
@@ -40,7 +41,7 @@ export const SESSION_ORDERING_CAPACITY = 1024;
  */
 export const SESSION_ORDERING_RETENTION_MS = ADMIN_SESSION_POLICY.absoluteLifetimeSeconds * 1000;
 /**
- * Allowed clock difference between this host and Keycloak when checking an ID
+ * Allowed clock difference between this host and Authentik when checking an ID
  * token's `exp` and `iat`. A token issued further in the future is rejected.
  */
 export const ID_TOKEN_CLOCK_TOLERANCE_SECONDS = 30;
@@ -49,12 +50,12 @@ const ID_TOKEN_ALGORITHMS = [
   'RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512', 'EdDSA',
 ];
 
-export type KeycloakUnavailableReason = 'timeout' | 'network' | 'http-error' | 'protocol' | 'busy' | 'not-configured';
+export type AuthentikUnavailableReason = 'timeout' | 'network' | 'http-error' | 'protocol' | 'busy' | 'not-configured';
 
-export type KeycloakRevalidationResult =
+export type AuthentikRevalidationResult =
   | {
       status: 'ok';
-      /** The rotated refresh token Keycloak issued in exchange for the old one. */
+      /** The rotated refresh token Authentik issued in exchange for the old one. */
       refreshToken: string;
       idToken: string;
       /** Replaces the cached groups; never merged with them. */
@@ -63,22 +64,22 @@ export type KeycloakRevalidationResult =
       validatedAt: number;
       refreshExpiresAt?: number;
     }
-  /** Keycloak explicitly refused the grant: the session must end. */
+  /** Authentik explicitly refused the grant: the session must end. */
   | { status: 'revoked' }
-  /** Keycloak could not be reached or its answer could not be trusted. */
-  | { status: 'unavailable'; reason: KeycloakUnavailableReason };
+  /** Authentik could not be reached or its answer could not be trusted. */
+  | { status: 'unavailable'; reason: AuthentikUnavailableReason };
 
-export interface KeycloakRevalidationInput {
+export interface AuthentikRevalidationInput {
   refreshToken: string;
-  keycloakSub: string;
+  authentikSub: string;
   /** Where this refresh token sits in its login; recorded when it is rotated. */
   lineage?: SessionLineage;
 }
 
-export type KeycloakRevalidator = (input: KeycloakRevalidationInput) => Promise<KeycloakRevalidationResult>;
+export type AuthentikRevalidator = (input: AuthentikRevalidationInput) => Promise<AuthentikRevalidationResult>;
 
 /** Revalidation state kept in the encrypted Auth.js JWT. */
-export interface KeycloakSessionState extends KeycloakRevalidationInput {
+export interface AuthentikSessionState extends AuthentikRevalidationInput {
   lastValidatedAt: number;
   refreshExpiresAt?: number;
   lineage: SessionLineage;
@@ -110,18 +111,18 @@ export function readSessionLineage(token: Record<string, unknown>): SessionLinea
  * existed (or otherwise incomplete): they cannot be revalidated or ordered, so
  * they must sign in again.
  */
-export function readKeycloakSessionState(token: Record<string, unknown>): KeycloakSessionState | null {
+export function readAuthentikSessionState(token: Record<string, unknown>): AuthentikSessionState | null {
   const refreshToken = nonEmptyString(token.refreshToken);
-  const keycloakSub = nonEmptyString(token.keycloakSub);
+  const authentikSub = nonEmptyString(token.authentikSub);
   const lastValidatedAt = positiveNumber(token.lastValidatedAt);
   const lineage = readSessionLineage(token);
-  if (!refreshToken || !keycloakSub || lastValidatedAt === null || !lineage) return null;
-  return { refreshToken, keycloakSub, lastValidatedAt, refreshExpiresAt: positiveNumber(token.refreshExpiresAt) ?? undefined, lineage };
+  if (!refreshToken || !authentikSub || lastValidatedAt === null || !lineage) return null;
+  return { refreshToken, authentikSub, lastValidatedAt, refreshExpiresAt: positiveNumber(token.refreshExpiresAt) ?? undefined, lineage };
 }
 
 /**
  * Process-local coordination of refreshes. Requests carrying the same refresh
- * state share one Keycloak call, and a successful result stays reusable for
+ * state share one Authentik call, and a successful result stays reusable for
  * REFRESH_RESULT_REUSE_MS. Entries are keyed by a SHA-256 digest, never the raw
  * token; both maps are capped and in-flight entries are removed on completion.
  *
@@ -143,8 +144,8 @@ export function readKeycloakSessionState(token: Record<string, unknown>): Keyclo
  * state and would redeem an already-rotated refresh token.
  */
 export class RefreshSingleFlight {
-  private readonly inFlight = new Map<string, Promise<KeycloakRevalidationResult>>();
-  private readonly settled = new Map<string, { result: KeycloakRevalidationResult; expiresAt: number }>();
+  private readonly inFlight = new Map<string, Promise<AuthentikRevalidationResult>>();
+  private readonly settled = new Map<string, { result: AuthentikRevalidationResult; expiresAt: number }>();
   /** loginId → highest refresh generation issued. Oldest write first. */
   private readonly logins = new Map<string, { latestGeneration: number; writtenAt: number }>();
   /** browserInstanceId → its current login (null after sign-out). */
@@ -160,8 +161,8 @@ export class RefreshSingleFlight {
   run(
     key: string,
     now: () => number,
-    refresh: () => Promise<KeycloakRevalidationResult>,
-  ): Promise<KeycloakRevalidationResult> {
+    refresh: () => Promise<AuthentikRevalidationResult>,
+  ): Promise<AuthentikRevalidationResult> {
     const reusable = this.settled.get(key);
     if (reusable) {
       if (now() < reusable.expiresAt) return Promise.resolve(reusable.result);
@@ -183,7 +184,7 @@ export class RefreshSingleFlight {
     return started;
   }
 
-  private remember(key: string, result: KeycloakRevalidationResult, nowMs: number): void {
+  private remember(key: string, result: AuthentikRevalidationResult, nowMs: number): void {
     for (const [existing, entry] of this.settled) {
       if (nowMs >= entry.expiresAt) this.settled.delete(existing);
     }
@@ -257,7 +258,7 @@ export class RefreshSingleFlight {
   }
 }
 
-const SHARED_SINGLE_FLIGHT = Symbol.for('auraplex.admin.keycloakRefreshSingleFlight');
+const SHARED_SINGLE_FLIGHT = Symbol.for('auraplex.admin.authentikRefreshSingleFlight');
 
 /**
  * One instance per process. Proxy and the route handlers can be bundled
@@ -268,12 +269,12 @@ export function sharedRefreshSingleFlight(): RefreshSingleFlight {
   return (holder[SHARED_SINGLE_FLIGHT] ??= new RefreshSingleFlight());
 }
 
-function refreshStateKey({ keycloakSub, refreshToken }: KeycloakRevalidationInput): string {
-  return createHash('sha256').update(keycloakSub).update('\0').update(refreshToken).digest('base64url');
+function refreshStateKey({ authentikSub, refreshToken }: AuthentikRevalidationInput): string {
+  return createHash('sha256').update(authentikSub).update('\0').update(refreshToken).digest('base64url');
 }
 
 class Unavailable extends Error {
-  constructor(readonly reason: KeycloakUnavailableReason) {
+  constructor(readonly reason: AuthentikUnavailableReason) {
     super(reason);
   }
 }
@@ -285,21 +286,24 @@ interface ProviderMetadata {
   expiresAt: number;
 }
 
-export interface KeycloakRevalidatorOptions {
-  config: KeycloakConfig;
+export interface AuthentikRevalidatorOptions {
+  config: AuthentikConfig;
   fetcher?: typeof fetch;
   now?: () => number;
   production?: boolean;
   singleFlight?: RefreshSingleFlight;
+  /** Log the claim structure of every refreshed ID token (logIdTokenClaimShape). */
+  debugClaims?: boolean;
 }
 
-export function createKeycloakRevalidator({
+export function createAuthentikRevalidator({
   config,
   fetcher = fetch,
   now = Date.now,
   production = process.env.NODE_ENV === 'production',
   singleFlight = sharedRefreshSingleFlight(),
-}: KeycloakRevalidatorOptions): KeycloakRevalidator {
+  debugClaims = false,
+}: AuthentikRevalidatorOptions): AuthentikRevalidator {
   let metadata: ProviderMetadata | null = null;
 
   async function request(url: string, init: RequestInit, signal: AbortSignal): Promise<Response> {
@@ -321,8 +325,15 @@ export function createKeycloakRevalidator({
     throw new Unavailable('protocol');
   }
 
-  /** Endpoints must be advertised by, and live under, the configured issuer. */
-  function issuerEndpoint(value: unknown): string {
+  /**
+   * Endpoints must be advertised by the configured issuer's discovery
+   * document and served from the issuer's origin, so the client secret and
+   * refresh token are never sent to another host. Only the token endpoint may
+   * sit outside the issuer path: Authentik serves one for all providers
+   * (`/application/o/token/`). The signing keys must be this provider's own,
+   * under the issuer path (`<issuer>jwks/`).
+   */
+  function issuerEndpoint(value: unknown, { underIssuerPath }: { underIssuerPath: boolean }): string {
     const issuer = new URL(config.issuer);
     let endpoint: URL;
     try {
@@ -330,9 +341,8 @@ export function createKeycloakRevalidator({
     } catch {
       throw new Unavailable('protocol');
     }
-    const insideIssuer = endpoint.origin === issuer.origin &&
-      endpoint.pathname.startsWith(`${issuer.pathname.replace(/\/$/, '')}/`);
-    if (!insideIssuer || (production && endpoint.protocol !== 'https:')) throw new Unavailable('protocol');
+    const inPath = !underIssuerPath || endpoint.pathname.startsWith(`${issuer.pathname.replace(/\/$/, '')}/`);
+    if (endpoint.origin !== issuer.origin || !inPath || (production && endpoint.protocol !== 'https:')) throw new Unavailable('protocol');
     return endpoint.toString();
   }
 
@@ -344,10 +354,10 @@ export function createKeycloakRevalidator({
 
   async function loadMetadata(signal: AbortSignal): Promise<ProviderMetadata> {
     if (metadata && now() < metadata.expiresAt) return metadata;
-    const discovery = await fetchJson(`${config.issuer}/.well-known/openid-configuration`, signal);
+    const discovery = await fetchJson(oidcDiscoveryUrl(config.issuer), signal);
     if (discovery.issuer !== config.issuer) throw new Unavailable('protocol');
-    const tokenEndpoint = issuerEndpoint(discovery.token_endpoint);
-    const jwksUri = issuerEndpoint(discovery.jwks_uri);
+    const tokenEndpoint = issuerEndpoint(discovery.token_endpoint, { underIssuerPath: false });
+    const jwksUri = issuerEndpoint(discovery.jwks_uri, { underIssuerPath: true });
     const jwks = await fetchJson(jwksUri, signal);
     if (!Array.isArray(jwks.keys)) throw new Unavailable('protocol');
     metadata = {
@@ -359,13 +369,13 @@ export function createKeycloakRevalidator({
     return metadata;
   }
 
-  async function verifyIdToken(idToken: string, keycloakSub: string, signal: AbortSignal) {
+  async function verifyIdToken(idToken: string, authentikSub: string, signal: AbortSignal) {
     const verify = async () => {
       const { keys } = await loadMetadata(signal);
       const { payload } = await jwtVerify(idToken, keys, {
         issuer: config.issuer,
         audience: config.clientId,
-        subject: keycloakSub,
+        subject: authentikSub,
         algorithms: ID_TOKEN_ALGORITHMS,
         requiredClaims: ['exp', 'iat'],
         currentDate: new Date(now()),
@@ -388,14 +398,14 @@ export function createKeycloakRevalidator({
       return await verify();
     } catch (error) {
       if (!(error instanceof joseErrors.JWKSNoMatchingKey)) throw error;
-      // Keycloak may have rotated its signing key since the JWKS was cached.
+      // Authentik may have rotated its signing key since the JWKS was cached.
       metadata = null;
       return verify();
     }
   }
 
-  async function refresh({ refreshToken, keycloakSub }: KeycloakRevalidationInput): Promise<KeycloakRevalidationResult> {
-    const signal = AbortSignal.timeout(KEYCLOAK_REVALIDATION_TIMEOUT_MS);
+  async function refresh({ refreshToken, authentikSub }: AuthentikRevalidationInput): Promise<AuthentikRevalidationResult> {
+    const signal = AbortSignal.timeout(AUTHENTIK_REVALIDATION_TIMEOUT_MS);
     try {
       const { tokenEndpoint } = await loadMetadata(signal);
       const credentials = Buffer.from(
@@ -408,14 +418,17 @@ export function createKeycloakRevalidator({
           authorization: `Basic ${credentials}`,
           'content-type': 'application/x-www-form-urlencoded',
         },
+        // No `scope`: Authentik then grants the refresh token's original
+        // scopes, so `profile` (and with it `groups`) is in every new ID token.
         body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }).toString(),
       }, signal);
 
       if (!response.ok) {
         if (response.status >= 500) return { status: 'unavailable', reason: 'http-error' };
-        // Keycloak answers invalid_grant for a revoked, expired or reused
-        // refresh token, an ended SSO session and a disabled user. Any other
-        // rejection (e.g. invalid_client) is a deployment fault, not the user's.
+        // Authentik answers invalid_grant for a refresh token it does not
+        // know, that has expired, or that it has revoked (rotation revokes the
+        // one presented). Any other rejection (e.g. invalid_client) is a
+        // deployment fault, not the user's.
         const body = await json(response).catch(() => null);
         return body?.error === 'invalid_grant'
           ? { status: 'revoked' }
@@ -424,19 +437,21 @@ export function createKeycloakRevalidator({
 
       const body = await json(response);
       const idToken = nonEmptyString(body.id_token);
-      // Keycloak rotates the refresh token on use, so the one just presented is
+      // Authentik rotates the refresh token on use, so the one just presented is
       // spent. A success without a replacement cannot be revalidated again and
       // is not accepted; the spent token is never kept.
       const rotatedRefreshToken = nonEmptyString(body.refresh_token);
       if (!idToken || !rotatedRefreshToken || rotatedRefreshToken === refreshToken) throw new Unavailable('protocol');
-      const claims = await verifyIdToken(idToken, keycloakSub, signal);
+      const claims = await verifyIdToken(idToken, authentikSub, signal);
+      if (debugClaims) logIdTokenClaimShape('refresh', claims);
       const validatedAt = Math.floor(now() / 1000);
+      // Not sent by Authentik; kept for providers that do.
       const refreshExpiresIn = positiveNumber(body.refresh_expires_in);
       return {
         status: 'ok',
         refreshToken: rotatedRefreshToken,
         idToken,
-        groups: extractKeycloakGroups(claims),
+        groups: extractAuthentikGroups(claims),
         validatedAt,
         refreshExpiresAt: refreshExpiresIn === null ? undefined : validatedAt + Math.floor(refreshExpiresIn),
       };

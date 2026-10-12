@@ -20,11 +20,13 @@ and production deployments. No application-side decision is outstanding.
 
 Detailed runtime and security behaviour is in
 [AURA-INT-001-runtime.md](AURA-INT-001-runtime.md). The original design is in
-[the RFC](../rfc/AURA-INT-001-admin-upload.md).
+[the RFC](../rfc/AURA-INT-001-admin-upload.md). The move from Keycloak to
+Authentik, and the checks that must be run against live Authentik, are in
+[AURA-INT-002-authentik.md](AURA-INT-002-authentik.md).
 
 **Status: not deployed. There has been no production deployment and no
 staging deployment. Nothing in this repository has been run against real
-Keycloak, MinIO, Qdrant, APISIX, Cloudflare Tunnel or Nomad.**
+Authentik, MinIO, Qdrant, APISIX, Cloudflare Tunnel or Nomad.**
 
 ## A. Implemented in code
 
@@ -33,14 +35,14 @@ Keycloak, MinIO, Qdrant, APISIX, Cloudflare Tunnel or Nomad.**
   Admin APIs and Auth.js. There are no other pages.
 - **Liveness endpoint.** `GET /api/health` returns `200` with
   `{"status":"ok","service":"auraplex-admin"}` and `Cache-Control: no-store`.
-  It is public, reads no session and contacts neither Keycloak, MinIO nor
+  It is public, reads no session and contacts neither Authentik, MinIO nor
   Qdrant. It reports only that the server process is answering; it is not a
   readiness check for those services.
 - **Authentication guard.** `proxy.ts` protects `/admin/*` and `/api/admin/*`
   except `/api/admin/uploads`, whose Route Handler authenticates each request
   itself so that large bodies are streamed rather than buffered.
 - **Session rules.** 30-minute idle timeout, 12-hour absolute lifetime, and
-  re-verification with Keycloak once the last verification is 60 seconds old,
+  re-verification with Authentik once the last verification is 60 seconds old,
   with mandatory refresh-token rotation. What happens when a re-verification
   does not succeed depends on why; see
   [Re-verification outcomes](#re-verification-outcomes).
@@ -61,7 +63,7 @@ Validated with automated tests and local builds only:
 
 - `npm ci`, `npm run typecheck`, `npm run lint`, `npm run build`.
 - The automated test suite (`npm test`), which uses an in-process fake
-  Keycloak and an in-process S3 endpoint.
+  Authentik and an in-process S3 endpoint.
 - The built server answering the routes above over HTTP on a developer
   machine, with throwaway credentials.
 
@@ -90,8 +92,8 @@ feature that needs it is used.
 | Variable | If missing |
 | --- | --- |
 | `AUTH_SECRET` | Every protected route answers 503. |
-| `KEYCLOAK_ISSUER`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | Required together with `AUTH_SECRET`. Sign-in is impossible and protected requests are refused. |
-| `AUTH_URL` | Not checked by the code. Logout cannot build the Keycloak logout redirect, so it clears the local session only and the Keycloak session stays open. Set it in every environment behind the ingress. |
+| `AUTHENTIK_ISSUER`, `AUTHENTIK_CLIENT_ID`, `AUTHENTIK_CLIENT_SECRET` | Required together with `AUTH_SECRET`. Sign-in is impossible and protected requests are refused. The `KEYCLOAK_*` names used before AURA-INT-002 are no longer read. |
+| `AUTH_URL` | Not checked by the code. Logout cannot build the Authentik logout redirect, so it clears the local session only and the Authentik session stays open. Set it in every environment behind the ingress. |
 
 **B. Required for upload and storage**
 
@@ -109,7 +111,8 @@ feature that needs it is used.
 
 | Variable | Default |
 | --- | --- |
-| `KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE` | `auraplex-uploader`, `auraplex-admin` |
+| `AUTHENTIK_UPLOADER_GROUP`, `AUTHENTIK_ADMIN_GROUP` | `auraplex-uploader`, `auraplex-admin` |
+| `ADMIN_AUTH_DEBUG_CLAIMS` | off. `1` logs the structure of each validated ID token (claim names; values of `iss`, `aud` and `groups` only). For verifying the Authentik provider. |
 | `MINIO_REGION` | `us-east-1` |
 | `ADMIN_UPLOAD_MAX_MB` | 100 (the application fallback, used in development and testing); range 1–500. Production is confirmed as 300 and set in the job. |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | 4 per process; range 1–16 |
@@ -133,9 +136,9 @@ Confirmed values, and where each one is wired:
 | --- | --- | --- |
 | `AUTH_URL` (production) | `https://admin-auraplex.auraplex.info` | yes, in `deploy/admin.nomad.hcl` |
 | `AUTH_URL` (staging) | `https://admin-auraplex-staging.auraplex.info` | no; documented only, no staging job exists |
-| `KEYCLOAK_ISSUER` | `https://keycloak.auraplex.info/realms/auraplex` | yes, in `deploy/admin.nomad.hcl` |
-| `KEYCLOAK_CLIENT_ID` | `auraplex-admin-upload` | yes, in `deploy/admin.nomad.hcl` |
-| `KEYCLOAK_CLIENT_SECRET` | source only: Vault path below | no; injection not wired |
+| `AUTHENTIK_ISSUER` | `https://auth.auraplex.info/application/o/admin-upload-provider/` (the trailing slash is part of it) | yes, in `deploy/admin.nomad.hcl` |
+| `AUTHENTIK_CLIENT_ID` | `2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN` | yes, in `deploy/admin.nomad.hcl` |
+| `AUTHENTIK_CLIENT_SECRET` | source only: Nomad variable below | no; injected by the deployed job, not by this draft |
 | `ADMIN_UPLOAD_MAX_MB` (production) | `300` | yes, in `deploy/admin.nomad.hcl` |
 
 One issuer and one client ID were supplied, with no separate staging client.
@@ -146,18 +149,20 @@ or the Qdrant variables; see [section E](#e-unresolved).
 
 | Secret | Source |
 | --- | --- |
-| `KEYCLOAK_CLIENT_SECRET` | Vault: `kv/auraplex/admin-upload/keycloak_client_secret` |
+| `AUTHENTIK_CLIENT_SECRET` | Nomad variable `nomad/jobs/admin-upload`, field `keycloak_client_secret` (the field keeps its Keycloak-era name) |
 | `AUTH_SECRET` | not supplied; required for authentication |
 | `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | not supplied; required for upload and storage |
 | `QDRANT_API_KEY` | not supplied; needed only if Qdrant requires a key |
 
-The Vault entry is a path reference only. No secret value, real or invented,
+The Nomad variable is a reference only. No secret value, real or invented,
 belongs in the job file, `.env.example`, the image or this document. Local
 `.env` files are excluded from the Docker build context by `.dockerignore`.
 
-How Nomad reads that path is **not wired**. This repository has no working
-Vault/Nomad integration to copy, so `deploy/admin.nomad.hcl` carries a TODO
-instead of guessed syntax.
+The deployed job renders that field into the environment; that job is
+Friendy's and is not this draft. Since AURA-INT-002 the field must be rendered
+as `AUTHENTIK_CLIENT_SECRET` (it was `KEYCLOAK_CLIENT_SECRET`); the field name
+itself does not change. `deploy/admin.nomad.hcl` carries a TODO instead of
+guessed syntax.
 
 ### The Nomad job draft
 
@@ -176,75 +181,79 @@ production-ready and must not be submitted to Nomad.**
 - It has not been validated: `nomad job validate` has not been run on it.
 - It is the production job only. No staging job exists.
 
-### Keycloak client
+### Authentik provider
 
-Realm `auraplex`, client `auraplex-admin-upload`, access type confidential.
-`<AUTH_URL>` stands for the public origin of the environment.
-
-The two URIs below are what the application sends. They differ from the
-callback and logout URLs Friendy supplied; he has confirmed that those are
-handled by the local server, so the application is unchanged. See
-[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris).
+OAuth2/OpenID provider `admin-upload-provider` on `https://auth.auraplex.info`
+(Authentik 2026.2.3), confidential client
+`2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN`. `<AUTH_URL>` stands for the public
+origin of the environment. Every endpoint is read from the issuer's discovery
+document, `<issuer>.well-known/openid-configuration`; none is configured.
 
 | Setting | Value |
 | --- | --- |
-| Redirect URI (callback) | `<AUTH_URL>/api/auth/callback/keycloak` is what the application sends. Client registration and the handling of the supplied URLs are Friendy's. |
-| Post-logout redirect URI | `<AUTH_URL>/signed-out` is what the application sends. Client registration and the handling of the supplied URLs are Friendy's. |
-| Root URL / web origin | `<AUTH_URL>`. Sign-in and logout are full-page redirects and token calls are made server-side, so no browser cross-origin access to Keycloak is needed. |
-| Client authentication | Confidential client with a secret; the token endpoint is called with Basic client authentication. |
-| Refresh tokens | Must be issued at sign-in and **rotated on every use**. A refresh that returns no new token is treated as a failure. |
-| ID token claims | Must include `groups`. Access is decided by group membership only; realm and client roles do not grant access. |
+| Redirect URI (callback), strict | `<AUTH_URL>/api/auth/callback/authentik`. The Auth.js provider id is `authentik`. |
+| Post-logout redirect URI | `<AUTH_URL>/signed-out` must be accepted for RP-initiated logout. |
+| Client authentication | Confidential client with a secret; the token endpoint is called with HTTP Basic (`client_secret_basic`). |
+| Scopes requested | `openid email profile offline_access` |
+| Scope mappings on the provider | `openid`, `email`, `profile` **and `offline_access`**. Authentik issues a refresh token only for `offline_access`, and silently drops a requested scope that has no mapping. Without it every sign-in is refused, logged as `admin_sign_in` / `no-refresh-token`. |
+| Refresh tokens | Issued at sign-in and **rotated on every use**. A refresh that returns no new token is treated as a failure. |
+| ID token claims | "Include claims in id_token" stays on: `groups` (the default `profile` mapping, the names of the user's groups) must be in the ID token at sign-in and on every refresh. Access is decided by group membership only. A user who is only in a child group of `auraplex-admin` is not listed under that name. |
+| Signing key | An RS256 key, published in the provider's JWKS. |
+| Subject mode | Leave as configured: `sub` is the key for upload ownership, so changing the subject mode later detaches users from their uploads. |
+| Invalidation flow | Must contain a User Logout stage for logout to end the Authentik session; see [Logout](#logout). |
+| Application binding | Only members of `auraplex-uploader` or `auraplex-admin` (policy engine mode ANY). The application checks the groups again itself. |
 
 Session and token timings the application relies on:
 
 | Item | Value | Where it is set |
 | --- | --- | --- |
-| Access token lifespan | 5 minutes (expected) | Keycloak |
+| Access token validity | not relied on; the access token is not kept | Authentik provider |
+| Refresh token validity | at least 30 minutes, the idle timeout; a shorter validity ends idle sessions early | Authentik provider |
 | Authoritative re-verification | every 60 seconds | fixed in code |
 | Session idle timeout | 30 minutes | fixed in code |
 | Session absolute lifetime | 12 hours | fixed in code |
-| Keycloak SSO Session Idle / Max | 30 minutes / 10 hours, as previously confirmed | Keycloak |
 
 The application does not keep the access token. Removing a user's group,
-disabling the user or ending the SSO session takes effect at the next
-re-verification, within 60 seconds. Keycloak's SSO Session Max ends a session
-before the local 12-hour limit if it is shorter.
+deactivating the user or ending their Authentik session takes effect at the
+next re-verification, within 60 seconds.
 
 ### Re-verification outcomes
 
-The application does **not** contact Keycloak on every request. While the
+The application does **not** contact Authentik on every request. While the
 last verification is less than 60 seconds old, the groups stored in the
 encrypted session cookie are used. Once it is 60 seconds old or more, the
-next authenticated request redeems the refresh token at Keycloak before
+next authenticated request redeems the refresh token at Authentik before
 anything privileged runs. The result of that call decides what happens:
 
-| Keycloak outcome | Result |
+| Authentik outcome | Result |
 | --- | --- |
-| Keycloak cannot be reached, times out, answers with a server error, or rejects the request for a reason other than the refresh token itself (for example a client misconfiguration) | Fail closed: **503** `IDENTITY_PROVIDER_UNAVAILABLE`. The stored groups are not used. The session cookie is left as it is, so the browser can retry. |
+| Authentik cannot be reached, times out, answers with a server error, or rejects the request for a reason other than the refresh token itself (for example a client misconfiguration) | Fail closed: **503** `IDENTITY_PROVIDER_UNAVAILABLE`. The stored groups are not used. The session cookie is left as it is, so the browser can retry. |
 | The response is malformed, carries no new refresh token, or its ID token fails verification | The same **503**. Nothing from the response is trusted. |
-| Keycloak explicitly rejects the refresh token (`invalid_grant`: token revoked or expired, SSO session ended, user disabled) | The session is no longer valid: the local session is cleared, APIs answer **401** `UNAUTHENTICATED`, pages redirect to sign-in, and the user must authenticate again. |
-| The refresh succeeds but the fresh groups no longer include a required group | Access is denied: **403** `FORBIDDEN`. |
+| Authentik explicitly rejects the refresh token (`invalid_grant`: the token is unknown, expired or revoked; ending the user's Authentik session or deactivating the user is expected to cause this, to be confirmed live per [AURA-INT-002](AURA-INT-002-authentik.md)) | The session is no longer valid: the local session is cleared, APIs answer **401** `UNAUTHENTICATED`, pages redirect to sign-in, and the user must authenticate again. |
+| The refresh succeeds but the fresh groups no longer include a required group | Access is denied: **403** `FORBIDDEN`. (If Authentik itself refuses the refresh because the user no longer passes the application binding, the row above applies instead.) |
 
-A Keycloak outage therefore blocks Admin use within 60 seconds, for as long
+A Authentik outage therefore blocks Admin use within 60 seconds, for as long
 as it lasts, without signing anyone out.
 
 ### Logout
 
 Signing out always clears the local Auth.js session and always ends on
-`/signed-out`. What happens to the Keycloak SSO session depends on the path
+`/signed-out`. What happens to the Authentik SSO session depends on the path
 taken:
 
-- **Normal path.** The application finds Keycloak's logout endpoint through
-  OIDC discovery and sends the browser there with the server-held ID token.
-  Keycloak then returns the browser to `<AUTH_URL>/signed-out`. Ending the
-  SSO session is Keycloak's action: it is expected, subject to Keycloak's
-  behaviour and the client's configuration, and the application does not
-  verify it.
+- **Normal path.** The application finds the provider's `end_session_endpoint`
+  (`<issuer>end-session/`) through OIDC discovery and sends the browser there
+  with the server-held ID token, `client_id` and
+  `post_logout_redirect_uri=<AUTH_URL>/signed-out`. Authentik then runs the
+  provider's invalidation flow. The Authentik SSO session ends only if that
+  flow contains a User Logout stage; Authentik's default provider invalidation
+  flow is expected not to, and would leave the user signed in to Authentik.
+  The application does not verify which happened.
 - **Fallback path.** If discovery cannot be completed in time, or no ID token
   is held, the application still clears the local session and sends the
-  browser straight to `/signed-out`. Keycloak is not involved, so the SSO
+  browser straight to `/signed-out`. Authentik is not involved, so the SSO
   session is **not** known to have ended, and nothing should describe it as
-  ended. The user may still be signed in to Keycloak and to other
+  ended. The user may still be signed in to Authentik and to other
   applications that use it.
 
 ### Ingress
@@ -301,7 +310,7 @@ differently:
 **Survives a restart**, because it is carried in the browser's encrypted
 session cookie and not in the server: the signed-in identity, the stored
 groups, the sign-in time and last-activity time behind the 30-minute and
-12-hour limits, the time of the last Keycloak verification, and the Keycloak
+12-hour limits, the time of the last Authentik verification, and the Authentik
 refresh token.
 
 **Lost on a restart**, because it is process-local:
@@ -314,7 +323,7 @@ refresh token.
   seconds by requests still carrying the previous cookie);
 - login-generation and browser ordering records, which decide whose response
   may write the session cookie;
-- the in-memory caches of Keycloak discovery metadata and signing keys
+- the in-memory caches of Authentik discovery metadata and signing keys
   (JWKS).
 
 Consequences of a restart:
@@ -324,19 +333,19 @@ Consequences of a restart:
   briefly looser than configured.
 - A signed-in user whose cookie is still within its limits can usually carry
   on. Their next request is judged as described under
-  [Re-verification outcomes](#re-verification-outcomes): Keycloak is
+  [Re-verification outcomes](#re-verification-outcomes): Authentik is
   contacted only if the last verification is 60 seconds old or more, not on
   every request.
 - Users **may need to authenticate again**. This happens when the cookie has
-  passed a limit, when Keycloak refuses the refresh token, or when a response
+  passed a limit, when Authentik refuses the refresh token, or when a response
   carrying a rotated refresh token was lost in the restart so that the
-  browser still holds a token Keycloak has already consumed.
+  browser still holds a token Authentik has already consumed.
 - The ordering protection for overlapping responses starts empty: until new
   records exist, a late response from before the restart is not recognised
   as stale.
 
 None of the lost state authenticates anyone. A restart does not let a request
-through that the session limits or Keycloak would refuse. It also provides no
+through that the session limits or Authentik would refuse. It also provides no
 continuity across instances: nothing here is cluster-wide.
 
 ## D. Confirmed deployment values
@@ -350,11 +359,13 @@ of it is deployed.
 | Production hostname | `admin-auraplex.auraplex.info` | yes, as `AUTH_URL` in the job draft |
 | Staging hostname | `admin-auraplex-staging.auraplex.info` | no; documented only |
 | Ingress path | Node → APISIX → Cloudflare Tunnel | no; not in this repository |
-| Keycloak realm | `auraplex` | yes, as part of the issuer |
-| Keycloak issuer | `https://keycloak.auraplex.info/realms/auraplex` | yes |
-| Keycloak client ID | `auraplex-admin-upload` | yes |
-| Keycloak access type | confidential | n/a; a Keycloak-side setting |
-| Keycloak client secret source | Vault: `kv/auraplex/admin-upload/keycloak_client_secret` | no; path referenced in a comment only |
+| Identity provider | Authentik 2026.2.3 at `https://auth.auraplex.info`, replacing Keycloak (AURA-INT-002) | n/a |
+| Authentik provider slug | `admin-upload-provider` | yes, as part of the issuer |
+| Authentik issuer | `https://auth.auraplex.info/application/o/admin-upload-provider/` | yes |
+| Authentik client ID | `2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN` | yes |
+| Authentik client type | confidential | n/a; an Authentik-side setting |
+| Authentik client secret source | Nomad variable `nomad/jobs/admin-upload`, field `keycloak_client_secret` | no; referenced in a comment only |
+| Admin groups | `auraplex-uploader`, `auraplex-admin` | yes, as the application defaults |
 | Nomad job name | `admin-upload` | yes |
 | Nomad task group | `web` | yes |
 | Consul service name | `admin-upload` | yes |
@@ -365,38 +376,33 @@ of it is deployed.
 | Resources | CPU `500`, memory `512` MB | yes |
 | Deployment model | single instance | yes, `count = 1` |
 | Production upload cap | 300 MB | yes, `ADMIN_UPLOAD_MAX_MB = "300"` in the job draft |
-| Keycloak callback and logout URLs | the supplied URLs are handled by the local server; the Auth.js routes stay as they are | n/a; no application change |
+| Authentik redirect URI | `https://admin-auraplex.auraplex.info/api/auth/callback/authentik`, registered | yes; provider id `authentik` in the application |
 | Remaining infrastructure and deployment work | handled by Friendy | n/a |
 
 "Wired" means present in `deploy/admin.nomad.hcl`, which is a draft of the
 production job. There is no staging job.
 
-### Keycloak callback and logout URIs
+### Authentik callback and logout URIs
 
-**Settled; no application change.** Friendy confirmed that the callback and
-logout URLs he supplied are handled by the local server. The current Auth.js
-routes therefore remain unchanged, and no further application decision is
-required.
+The application's Auth.js provider id is `authentik`, so it completes sign-in
+on `/api/auth/callback/authentik`: the redirect URI registered on the
+Authentik provider. It starts sign-in on its own public `/sign-in` route,
+because Auth.js v5 refuses a browser GET to `/api/auth/signin/<provider>`
+(the `UnknownAction` seen on the first deployment).
 
-| | Supplied by Friendy | Sent by the application |
+| | Registered on the provider | Sent by the application |
 | --- | --- | --- |
-| Production callback | `https://admin-auraplex.auraplex.info/api/auth/callback` | `https://admin-auraplex.auraplex.info/api/auth/callback/keycloak` |
-| Production logout | `https://admin-auraplex.auraplex.info/api/auth/logout` | post-logout redirect to `https://admin-auraplex.auraplex.info/signed-out` |
-| Staging callback | `https://admin-auraplex-staging.auraplex.info/api/auth/callback` | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/keycloak` |
-| Staging logout | `https://admin-auraplex-staging.auraplex.info/api/auth/logout` | post-logout redirect to `https://admin-auraplex-staging.auraplex.info/signed-out` |
+| Production callback | `https://admin-auraplex.auraplex.info/api/auth/callback/authentik` | `https://admin-auraplex.auraplex.info/api/auth/callback/authentik` |
+| Production logout | to be confirmed | post-logout redirect to `https://admin-auraplex.auraplex.info/signed-out` |
+| Staging callback | not registered | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/authentik` |
+| Staging logout | not registered | post-logout redirect to `https://admin-auraplex-staging.auraplex.info/signed-out` |
 
-- Application routes, the Auth.js configuration, the logout implementation and
-  `post_logout_redirect_uri` are unchanged and stay that way. The application
-  itself still has no `/api/auth/callback` route without the provider segment
-  and no `/api/auth/logout` route: Auth.js completes sign-in on
-  `/api/auth/callback/keycloak`, and logout returns to `/signed-out`.
-- How the local server handles the supplied URLs is not part of this
-  repository and is not described here. That handling, and the registration
-  on client `auraplex-admin-upload`, are Friendy's.
-- For reference when it is set up: the right-hand column is what the
-  application puts in `redirect_uri` and `post_logout_redirect_uri`, and
-  Keycloak compares those exactly unless a wildcard is registered. Sign-in
-  and logout against the real realm are checks 4 and 8 in
+- Authentik compares the redirect URI strictly, so scheme, host and path must
+  match exactly.
+- The application has no `/api/auth/callback` route without the provider
+  segment and no `/api/auth/logout` route. The URLs supplied for the Keycloak
+  client under AURA-INT-001 no longer apply.
+- Sign-in and logout against the real provider are checks 4 and 8 in
   [section F](#f-production-smoke-tests).
 
 ## E. Unresolved
@@ -408,15 +414,15 @@ networking, Docker image publishing, APISIX and Cloudflare, and the staging
 and production deployments. None of them needs an application-side decision.
 
 The two questions that were open on the application side are settled and are
-recorded in [section D](#d-confirmed-deployment-values): the Keycloak
-callback and logout URLs, and the production upload cap of 300 MB.
+recorded in [section D](#d-confirmed-deployment-values): the callback URI,
+now the registered Authentik one, and the production upload cap of 300 MB.
 
 ### Open items
 
 | # | Item | State |
 | --- | --- | --- |
 | 1 | Ingress limits for the 300 MB upload cap | The cap itself is decided: 300 MB, set as `ADMIN_UPLOAD_MAX_MB` in the job. Not verified: that APISIX and Cloudflare pass request bodies of at least that size. Cloudflare's request-body limit depends on the plan; see the [runtime notes](AURA-INT-001-runtime.md). |
-| 2 | Vault/Nomad injection of `KEYCLOAK_CLIENT_SECRET` | Path confirmed; mechanism not wired. Needed: the KV engine version, whether `keycloak_client_secret` is a secret or a field inside `kv/auraplex/admin-upload`, and the Vault role or policy for the job. |
+| 2 | Nomad injection of `AUTHENTIK_CLIENT_SECRET` | Source confirmed: Nomad variable `nomad/jobs/admin-upload`, field `keycloak_client_secret`, injected by the deployed job (Friendy's). Since AURA-INT-002 that job must render the field as `AUTHENTIK_CLIENT_SECRET`, and set `AUTHENTIK_ISSUER` and `AUTHENTIK_CLIENT_ID` instead of the `KEYCLOAK_*` names. Not in this draft. |
 | 3 | `AUTH_SECRET` | Value and source not supplied. |
 | 4 | MinIO endpoint, access key and secret key | Not supplied. The three buckets must exist and the key needs the documented policy. |
 | 5 | Qdrant URL and, if required, API key | Not supplied. |
@@ -427,7 +433,8 @@ callback and logout URLs, and the production upload cap of 300 MB.
 | 10 | Staging deployment identity | Only the staging hostname was supplied. No staging job, node or image is defined. |
 | 12 | Overlap during job updates | `count = 1` does not by itself rule out an old and a new allocation running briefly together. No update policy is defined and none has been tested. |
 | 13 | Nomad validation | `nomad job validate` has not been run on the draft. |
-| 11 | That the real client issues rotated refresh tokens and puts `groups` in refreshed ID tokens | Not verified against the real realm. |
+| 11 | That the real provider issues rotated refresh tokens and puts `groups` in sign-in and refreshed ID tokens | Not verified against live Authentik. Its discovery document (checked 2026-10-12) lists only the `openid`, `email` and `profile` scopes, so the `offline_access` mapping appears to be missing and no refresh token would be issued. See [AURA-INT-002](AURA-INT-002-authentik.md). |
+| 14 | Authentik post-logout redirect and invalidation flow | Not verified: that `<AUTH_URL>/signed-out` is accepted as the post-logout redirect, and that the provider's invalidation flow ends the Authentik session. See [Logout](#logout). |
 
 Also outstanding before sign-off: the Docker build and container smoke test
 described in section B, and triage of the open `npm audit` findings in
@@ -442,13 +449,13 @@ None has been run.
 | --- | --- | --- |
 | 1 | `GET /api/health` | 200 with the fixed JSON body |
 | 2 | Anonymous `GET /signed-out` | 200 |
-| 3 | Anonymous `GET /admin/upload` | Redirect to Keycloak sign-in |
+| 3 | Anonymous `GET /admin/upload` | Redirect to `/sign-in`, then to Authentik's authorization endpoint; no `UnknownAction` in the log |
 | 4 | Sign in as a user in the uploader or admin group | Upload workspace opens |
-| 5 | Sign in as a user in neither group | Access refused |
-| 6 | Remove a signed-in user's group in Keycloak | Access denied (403) within 60 seconds |
-| 7 | End a signed-in user's Keycloak session, or disable the user | Within 60 seconds the user is signed out and must authenticate again |
-| 8 | Sign out (normal path) | The browser passes through Keycloak's logout endpoint and lands on `/signed-out`; the local session is cleared. Then confirm in Keycloak that the SSO session has ended: the application does not verify this itself |
-| 9 | Sign out while Keycloak discovery is unreachable from the application (fallback path), if this can be arranged safely | The browser still lands on `/signed-out` and the local session is cleared. The Keycloak SSO session is **not** expected to have ended; do not record it as ended |
+| 5 | Sign in as a user in neither group | Refused by the Authentik application binding; if the binding lets the user through, the application answers 403 |
+| 6 | Remove a signed-in user's group in Authentik | Access denied (403) within 60 seconds |
+| 7 | End a signed-in user's Authentik session, or disable the user | Within 60 seconds the user is signed out and must authenticate again |
+| 8 | Sign out (normal path) | The browser passes through Authentik's end-session endpoint and lands on `/signed-out`; the local session is cleared. Then confirm the Authentik session has ended (opening `https://auth.auraplex.info/` asks for a login again): the application does not verify this itself |
+| 9 | Sign out while Authentik discovery is unreachable from the application (fallback path), if this can be arranged safely | The browser still lands on `/signed-out` and the local session is cleared. The Authentik SSO session is **not** expected to have ended; do not record it as ended |
 | 10 | Upload a small PDF | Succeeds |
 | 11 | Upload at the configured size limit, and just over it (300 MB in production) | At the limit succeeds; over it is rejected |
 | 12 | Upload a file whose contents do not match its type | Rejected |
@@ -489,8 +496,9 @@ done from one place.
 
 Settled since the first handoff, with no application change needed:
 
-- **Keycloak callback and logout URLs.** The supplied URLs are handled by the
-  local server; the Auth.js routes are unchanged. See [G5](#g5-keycloak-uris).
+- **Authentik callback URI.** `<AUTH_URL>/api/auth/callback/authentik` is
+  registered on the provider and is what the application sends. See
+  [G5](#g5-authentik-uris).
 - **Production upload cap.** 300 MB, set in the job draft. See
   [G7](#g7-upload-limits).
 
@@ -501,11 +509,12 @@ application decision, and nothing below can be finished without them.
 
 | # | Decision | Why it blocks |
 | --- | --- | --- |
-| 1 | How Nomad reads the Vault secret: KV engine version, whether `keycloak_client_secret` is a secret or a field, and the Vault role or policy for the job | The job has no secret injection. See [G4](#g4-environment-and-secrets). |
+| 1 | Rendering the Nomad variable field `keycloak_client_secret` as `AUTHENTIK_CLIENT_SECRET`, and setting `AUTHENTIK_ISSUER` and `AUTHENTIK_CLIENT_ID` instead of the `KEYCLOAK_*` names, in the deployed job | Sign-in fails with the old names. See [G4](#g4-environment-and-secrets). |
 | 2 | Values or sources for `AUTH_SECRET`, MinIO and Qdrant | Authentication, uploads and status do not work without them. |
 | 3 | Host port and network mode | The draft binds host port 3000 on `auraplex01`. See [G6](#g6-networking). |
 | 4 | Image tag strategy and how the image reaches `auraplex01` | Decides what CI publishes. See [G3](#g3-what-ci-must-build-and-publish). |
 | 5 | Staging identity: job, node, image | Only the staging hostname exists. See [G9](#g9-staging-checks). |
+| 6 | Authentik provider settings: the `offline_access` scope mapping, an invalidation flow that ends the Authentik session, and `<AUTH_URL>/signed-out` as an allowed post-logout redirect | Without the first, nobody can sign in. See [Authentik provider](#authentik-provider). |
 
 ### G2. Building the image
 
@@ -580,12 +589,13 @@ a missing one shows up when the feature that needs it is used.
 | Variable | Purpose | Required | Default | Secret | Expected source | Friendy |
 | --- | --- | --- | --- | --- | --- | --- |
 | `AUTH_SECRET` | Encrypts the session cookie and the Proxy identity handoff | yes, for authentication | none | **yes** | runtime secret injection; store not specified | provide: a long random value, kept the same across restarts |
-| `AUTH_URL` | Public origin of the application; used for the Keycloak logout redirect | yes, in any deployed environment | none | no | job `env` (production value is in the draft) | set the staging value in the staging job |
-| `KEYCLOAK_ISSUER` | Keycloak realm issuer URL | yes, for authentication | none | no | job `env` (in the draft) | nothing, unless staging differs |
-| `KEYCLOAK_CLIENT_ID` | Keycloak client ID | yes, for authentication | none | no | job `env` (in the draft) | nothing, unless staging differs |
-| `KEYCLOAK_CLIENT_SECRET` | Secret of the confidential Keycloak client | yes, for authentication | none | **yes** | Vault: `kv/auraplex/admin-upload/keycloak_client_secret` | wire the injection; see below |
-| `KEYCLOAK_UPLOADER_ROLE` | Keycloak group allowed to upload | no | `auraplex-uploader` | no | job `env`, only to override | confirm the group exists, or set another name |
-| `KEYCLOAK_ADMIN_ROLE` | Keycloak group allowed to administer and delete | no | `auraplex-admin` | no | job `env`, only to override | confirm the group exists, or set another name |
+| `AUTH_URL` | Public origin of the application; used for the Authentik logout redirect | yes, in any deployed environment | none | no | job `env` (production value is in the draft) | set the staging value in the staging job |
+| `AUTHENTIK_ISSUER` | Authentik provider issuer URL, trailing slash included | yes, for authentication | none | no | job `env` (in the draft) | nothing, unless staging differs |
+| `AUTHENTIK_CLIENT_ID` | Authentik client ID | yes, for authentication | none | no | job `env` (in the draft) | nothing, unless staging differs |
+| `AUTHENTIK_CLIENT_SECRET` | Secret of the confidential Authentik client | yes, for authentication | none | **yes** | Nomad variable `nomad/jobs/admin-upload`, field `keycloak_client_secret` | render the field under this name; see below |
+| `AUTHENTIK_UPLOADER_GROUP` | Authentik group allowed to upload | no | `auraplex-uploader` | no | job `env`, only to override | nothing; the group exists |
+| `AUTHENTIK_ADMIN_GROUP` | Authentik group allowed to administer and delete | no | `auraplex-admin` | no | job `env`, only to override | nothing; the group exists |
+| `ADMIN_AUTH_DEBUG_CLAIMS` | `1` logs the structure of each validated ID token, for verifying the provider | no | unset (off) | no | job `env`, temporarily | set only while verifying AURA-INT-002, then remove |
 | `MINIO_ENDPOINT` | MinIO S3 endpoint URL | yes, for upload and storage | none | no | job `env`; value not supplied | provide |
 | `MINIO_ACCESS_KEY` | MinIO access key | yes, for upload and storage | none | **yes** | runtime secret injection; store not specified | provide |
 | `MINIO_SECRET_KEY` | MinIO secret key | yes, for upload and storage | none | **yes** | runtime secret injection; store not specified | provide |
@@ -600,43 +610,40 @@ a missing one shows up when the feature that needs it is used.
 | `PORT` | Port the server listens on | yes | `3000` in the image | no | image and job `env` | nothing; see [G6](#g6-networking) |
 | `HOSTNAME` | Address the server binds to | yes | `0.0.0.0` in the image | no | image and job `env` | nothing |
 
-Secrets needing runtime injection: `AUTH_SECRET`, `KEYCLOAK_CLIENT_SECRET`,
+Secrets needing runtime injection: `AUTH_SECRET`, `AUTHENTIK_CLIENT_SECRET`,
 `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `QDRANT_API_KEY` and
 `ADMIN_TRUSTED_PROXY_SECRET` where they are used.
 
-- Only one Vault location has been supplied:
-  `kv/auraplex/admin-upload/keycloak_client_secret`. It is a path. No secret
-  value has been read, and none is in this repository.
-- The job contains no Vault or template stanza. Nothing here states the KV
-  engine version, whether `keycloak_client_secret` is the secret or a field
-  inside `kv/auraplex/admin-upload`, or which Vault role the job uses. The
-  injection has to be written from the pattern that already works for other
-  Auraplex jobs.
-- Where the other secrets live has not been specified.
+- The deployed job reads its secrets from the Nomad variable
+  `nomad/jobs/admin-upload` (fields `auth_secret`, `keycloak_client_secret`,
+  the MinIO fields and `qdrant_api_key`). That is a reference. No secret value
+  has been read, and none is in this repository.
+- The field `keycloak_client_secret` keeps its name. Since AURA-INT-002 it
+  holds the Authentik client secret and must be rendered as
+  `AUTHENTIK_CLIENT_SECRET`.
+- This draft contains no template stanza; the deployed job's injection is
+  Friendy's and is not copied here.
 - `AUTH_SECRET` must not change between restarts or redeployments unless the
   intention is to sign everyone out: existing session cookies cannot be read
   with a different value.
 
-### G5. Keycloak URIs
+### G5. Authentik URIs
 
-**Settled; no application change.** Friendy confirmed that the callback and
-logout URLs he supplied are handled by the local server, so the current
-Auth.js routes remain unchanged. The application sends:
+The application sends:
 
 | Environment | Redirect URI (callback) | Post-logout redirect URI |
 | --- | --- | --- |
-| Production | `https://admin-auraplex.auraplex.info/api/auth/callback/keycloak` | `https://admin-auraplex.auraplex.info/signed-out` |
-| Staging | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/keycloak` | `https://admin-auraplex-staging.auraplex.info/signed-out` |
+| Production | `https://admin-auraplex.auraplex.info/api/auth/callback/authentik` | `https://admin-auraplex.auraplex.info/signed-out` |
+| Staging | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/authentik` | `https://admin-auraplex-staging.auraplex.info/signed-out` |
 
-The URLs supplied for the client were `/api/auth/callback` and
-`/api/auth/logout` on the same hosts. The application itself has neither
-route and is not being changed to add them. How the local server handles the
-supplied URLs, and what is registered on client `auraplex-admin-upload`, are
-Friendy's and are not described in this repository. The comparison is in
-[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris).
+The production redirect URI is registered on the provider. The post-logout
+redirect must be accepted as well, and a staging environment needs both
+registered for its own host. The comparison is in
+[Authentik callback and logout URIs](#authentik-callback-and-logout-uris).
 
-The client must also issue refresh tokens, rotate them on every use, and put
-`groups` in the ID token; see [Keycloak client](#keycloak-client).
+The provider must also issue refresh tokens (the `offline_access` scope
+mapping), rotate them on every use, and put `groups` in the ID token; see
+[Authentik provider](#authentik-provider).
 
 ### G6. Networking
 
@@ -737,7 +744,7 @@ Already in the file and confirmed: job `admin-upload`, group `web`, service
 300 MB upload cap, and the `GET /api/health` check.
 
 The health check is liveness only. It passes with no secrets and with
-Keycloak, MinIO and Qdrant unreachable, so a healthy allocation is not proof
+Authentik, MinIO and Qdrant unreachable, so a healthy allocation is not proof
 of a working deployment.
 
 ### G9. Staging checks
@@ -745,8 +752,8 @@ of a working deployment.
 No staging environment is defined: there is no staging job, node or image,
 only the hostname `admin-auraplex-staging.auraplex.info`. Staging needs its
 own job with `AUTH_URL` set to `https://admin-auraplex-staging.auraplex.info`,
-the Keycloak client set up for the staging host
-([G5](#g5-keycloak-uris)), and an explicit `ADMIN_UPLOAD_MAX_MB` if staging
+the Authentik provider set up for the staging host
+([G5](#g5-authentik-uris)), and an explicit `ADMIN_UPLOAD_MAX_MB` if staging
 is to be tested at the production cap of 300 MB.
 
 Before production, on staging:
@@ -754,8 +761,8 @@ Before production, on staging:
 1. Run every check in [section F](#f-production-smoke-tests). They are
    written for the first deployment and apply to staging unchanged.
 2. Pay particular attention to the checks that have only ever run against
-   local fakes: sign-in and group checks against the real realm (4 to 7),
-   logout through Keycloak (8), an upload at the size cap through APISIX and
+   local fakes: sign-in and group checks against the real provider (4 to 7),
+   logout through Authentik (8), an upload at the size cap through APISIX and
    Cloudflare (11), and the stored object and Qdrant status (14, 15).
 3. Restart the allocation and repeat checks 1, 3 and 10 (check 19).
 4. Update the job once and confirm that only one allocation serves traffic

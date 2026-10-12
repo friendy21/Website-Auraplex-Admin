@@ -18,7 +18,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export interface SessionLineage {
   /** Opaque id of the browser profile that signed in. Not a credential. */
   browserInstanceId: string;
-  /** Random id of one Keycloak sign-in; fixed for the life of that login. */
+  /** Random id of one Authentik sign-in; fixed for the life of that login. */
   loginId: string;
   /** 0 at sign-in, +1 on every refresh-token rotation of that login. */
   refreshGeneration: number;
@@ -30,12 +30,12 @@ export type SessionEndReason =
   | 'local-idle-expired'
   /** 12 hours since sign-in. True for every cookie of the login. */
   | 'local-absolute-expired'
-  /** Keycloak refreshed the session, but a local limit passed meanwhile. */
+  /** Authentik refreshed the session, but a local limit passed meanwhile. */
   | 'refresh-succeeded-but-local-session-expired'
-  /** Keycloak refused the newest refresh token of the login: it is over. */
+  /** Authentik refused the newest refresh token of the login: it is over. */
   | 'provider-current-session-rejected'
   /**
-   * Keycloak refused a refresh token that a later, successful refresh of the
+   * Authentik refused a refresh token that a later, successful refresh of the
    * same login had already replaced. Says nothing about the newer session.
    */
   | 'provider-superseded-refresh-rejected'

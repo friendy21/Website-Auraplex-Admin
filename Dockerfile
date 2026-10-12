@@ -3,7 +3,7 @@
 #
 # Three stages: install from the lockfile, build, then run the Next.js
 # standalone server. All Admin secrets and service addresses (Auth.js,
-# Keycloak, MinIO, Qdrant) are server-only and read at RUNTIME; none is needed
+# Authentik, MinIO, Qdrant) are server-only and read at RUNTIME; none is needed
 # to build the image. See .env.example.
 FROM node:22-slim AS deps
 WORKDIR /app

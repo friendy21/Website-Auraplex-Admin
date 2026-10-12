@@ -22,7 +22,7 @@ import {
   type UploadApiResponse,
 } from '@/lib/admin/upload-contract';
 import { canRetryUpload, queueStatusAfterResponse } from '@/lib/admin/upload-ui-state';
-import { logoutFromKeycloak } from '@/app/admin/upload/actions';
+import { logoutFromAuthentik } from '@/app/admin/upload/actions';
 
 const ACCEPTED_EXTENSIONS = new Set(ACCEPTED_UPLOAD_EXTENSIONS);
 const SESSION_EXPIRED =
@@ -285,11 +285,11 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
 
           <div className="flex items-center gap-3">
             <div className="hidden text-right sm:block">
-              <p className="font-mono text-xs uppercase tracking-wider">Keycloak boundary prepared</p>
+              <p className="font-mono text-xs uppercase tracking-wider">Authentik boundary prepared</p>
               <p className="text-xs text-[color:var(--color-neutral-400)]">Runtime configuration required</p>
             </div>
-            <form action={logoutFromKeycloak}>
-              <button type="submit" aria-label="Sign out of Auraplex and Keycloak" className="grid h-10 w-10 place-items-center border border-[color:var(--color-neutral-700)] text-[color:var(--color-neutral-400)] hover:border-[color:var(--color-signal)] hover:text-[color:var(--color-signal)]">
+            <form action={logoutFromAuthentik}>
+              <button type="submit" aria-label="Sign out of Auraplex and Authentik" className="grid h-10 w-10 place-items-center border border-[color:var(--color-neutral-700)] text-[color:var(--color-neutral-400)] hover:border-[color:var(--color-signal)] hover:text-[color:var(--color-signal)]">
                 <LogOut aria-hidden="true" className="h-4 w-4" />
               </button>
             </form>

@@ -14,7 +14,7 @@ export interface QdrantConfig {
   apiKey?: string;
 }
 
-export interface KeycloakConfig {
+export interface AuthentikConfig {
   issuer: string;
   clientId: string;
   clientSecret: string;
@@ -81,30 +81,58 @@ export function tryGetQdrantConfig(
   return getQdrantConfig(env);
 }
 
-export function getKeycloakConfig(
+/**
+ * The issuer is kept exactly as configured. Authentik's per-provider issuer
+ * ends in a slash (`.../application/o/<slug>/`), and it is compared as an
+ * exact string with the discovery document and every ID token's `iss`, so
+ * the slash must not be normalised away as httpUrl() does for other URLs.
+ * A provider issuer configured without it is refused here, by name, rather
+ * than surfacing later as an issuer mismatch at sign-in and revalidation.
+ */
+function issuerUrl(value: string, name: string): string {
+  httpUrl(value, name);
+  if (/^\/application\/o\/[^/]+$/.test(new URL(value).pathname)) {
+    throw new UploadContractError(
+      503,
+      'BACKEND_NOT_CONFIGURED',
+      `${name} must end with "/" (Authentik provider issuers do)`,
+    );
+  }
+  return value;
+}
+
+/**
+ * OIDC Discovery 1.0 §4: the issuer without any trailing slash, followed by
+ * `/.well-known/openid-configuration`.
+ */
+export function oidcDiscoveryUrl(issuer: string): string {
+  return `${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`;
+}
+
+export function getAuthentikConfig(
   env: Environment = process.env,
-): KeycloakConfig {
-  const values = required(env, 'Keycloak', [
+): AuthentikConfig {
+  const values = required(env, 'Authentik', [
     'AUTH_SECRET',
-    'KEYCLOAK_ISSUER',
-    'KEYCLOAK_CLIENT_ID',
-    'KEYCLOAK_CLIENT_SECRET',
+    'AUTHENTIK_ISSUER',
+    'AUTHENTIK_CLIENT_ID',
+    'AUTHENTIK_CLIENT_SECRET',
   ]);
   return {
-    issuer: httpUrl(values.KEYCLOAK_ISSUER, 'KEYCLOAK_ISSUER'),
-    clientId: values.KEYCLOAK_CLIENT_ID,
-    clientSecret: values.KEYCLOAK_CLIENT_SECRET,
+    issuer: issuerUrl(values.AUTHENTIK_ISSUER, 'AUTHENTIK_ISSUER'),
+    clientId: values.AUTHENTIK_CLIENT_ID,
+    clientSecret: values.AUTHENTIK_CLIENT_SECRET,
   };
 }
 
-export function tryGetKeycloakConfig(
+export function tryGetAuthentikConfig(
   env: Environment = process.env,
-): KeycloakConfig | null {
+): AuthentikConfig | null {
   const configured = [
     env.AUTH_SECRET,
-    env.KEYCLOAK_ISSUER,
-    env.KEYCLOAK_CLIENT_ID,
-    env.KEYCLOAK_CLIENT_SECRET,
+    env.AUTHENTIK_ISSUER,
+    env.AUTHENTIK_CLIENT_ID,
+    env.AUTHENTIK_CLIENT_SECRET,
   ].some((value) => Boolean(value?.trim()));
-  return configured ? getKeycloakConfig(env) : null;
+  return configured ? getAuthentikConfig(env) : null;
 }

@@ -2,7 +2,7 @@ import { connection } from 'next/server';
 
 /**
  * Liveness check for the container or scheduler. Public and self-contained:
- * it reads no session and contacts neither Keycloak, MinIO nor Qdrant, so it
+ * it reads no session and contacts neither Authentik, MinIO nor Qdrant, so it
  * says only that this server process is answering requests. The body is
  * fixed and carries no version, configuration or environment detail.
  */

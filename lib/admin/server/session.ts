@@ -1,11 +1,11 @@
 import type { Session } from 'next-auth';
 import { decode, encode, getToken } from 'next-auth/jwt';
 import { UploadContractError } from '@/lib/admin/upload-errors';
-import { getKeycloakConfig } from '@/lib/admin/server/config';
+import { getAuthentikConfig } from '@/lib/admin/server/config';
 import { identityFromSession, type AdminIdentity } from '@/lib/admin/server/authorization';
 import { authSessionCookieName } from '@/lib/admin/server/auth-cookies';
 import { REVALIDATION_UNAVAILABLE_FLAG } from '@/lib/admin/server/session-policy';
-import { sharedRefreshSingleFlight, type RefreshSingleFlight } from '@/lib/admin/server/keycloak-revalidation';
+import { sharedRefreshSingleFlight, type RefreshSingleFlight } from '@/lib/admin/server/authentik-revalidation';
 import {
   runInAdminAuthScope,
   type AdminAuthScope,
@@ -16,18 +16,18 @@ import {
 export interface LoadedAdminSession {
   session: Session | null;
   /**
-   * The verified Keycloak subject of a valid session. It is the stable
+   * The verified Authentik subject of a valid session. It is the stable
    * identity used for upload ownership; it is read from the encrypted session
    * JWT on the server and is not part of the browser-visible session JSON.
    */
-  keycloakSub?: string;
+  authentikSub?: string;
   /**
    * Auth.js Set-Cookie headers from the same read: the re-issued session with
    * refreshed activity, or cookie removal when the session has expired.
    */
   setCookies: string[];
   /**
-   * Keycloak revalidation was due and could not be completed. The session is
+   * Authentik revalidation was due and could not be completed. The session is
    * neither trusted nor ended: the request is denied with 503 and the existing
    * cookie is left as it is, so the browser can retry.
    */
@@ -57,7 +57,7 @@ type ApiRouteAuth = (
  * (Proxy, route handlers, the admin page) runs the same `jwt` callback and
  * session policy. The no-argument `auth()` form discards the re-issued cookie;
  * the API-route form used here hands it back so activity can be persisted.
- * That same read performs the 60-second Keycloak revalidation when it is due.
+ * That same read performs the 60-second Authentik revalidation when it is due.
  * Only the session cookie (and its chunks) is forwarded; Auth.js's own CSRF
  * and callback cookies are left to its sign-in/sign-out routes.
  *
@@ -84,15 +84,15 @@ export function createAdminSessionLoader(
       return { session, setCookies, endReason: outcome?.status === 'ended' ? outcome.reason : undefined, withholdSessionCookies };
     }
     // Auth.js accepted this cookie, and the session callback deliberately
-    // leaves the Keycloak subject out of the session JSON, so it is read from
+    // leaves the Authentik subject out of the session JSON, so it is read from
     // the same encrypted JWT. Revalidation never changes it.
     const token = await getToken({
       req: { headers },
       secret: process.env.AUTH_SECRET,
       cookieName: sessionCookie,
     }).catch(() => null);
-    const keycloakSub = typeof token?.keycloakSub === 'string' && token.keycloakSub ? token.keycloakSub : undefined;
-    return { session, keycloakSub, setCookies, withholdSessionCookies };
+    const authentikSub = typeof token?.authentikSub === 'string' && token.authentikSub ? token.authentikSub : undefined;
+    return { session, authentikSub, setCookies, withholdSessionCookies };
   };
 }
 
@@ -115,7 +115,7 @@ export function isSessionCookie(setCookie: string, sessionCookie: string): boole
  * - Re-issued cookie whose refresh generation has been redeemed by a later
  *   refresh of the same login: it would put a consumed refresh token (and that
  *   generation's groups) back.
- * - Removal because Keycloak refused a refresh token that was already known to
+ * - Removal because Authentik refused a refresh token that was already known to
  *   be replaced: the refusal is about the old token, not the newer session.
  *
  * - Sign-out of a login the browser had already left: its removal is not
@@ -124,7 +124,7 @@ export function isSessionCookie(setCookie: string, sessionCookie: string): boole
  *   existing cookie is left exactly as it is.
  *
  * Every other removal is applied: idle or 12-hour expiry, a refresh that
- * succeeded but crossed a local limit, Keycloak refusing the login's newest
+ * succeeded but crossed a local limit, Authentik refusing the login's newest
  * refresh token, and sessions that cannot be revalidated. Without a reported
  * outcome (Auth.js could not read the cookie) nothing is withheld.
  *
@@ -170,7 +170,7 @@ export function identityFromLoadedSession(loaded: LoadedAdminSession): AdminIden
       'Sign-in could not be re-verified with the identity provider; retry shortly',
     );
   }
-  return identityFromSession(loaded.session, loaded.keycloakSub);
+  return identityFromSession(loaded.session, loaded.authentikSub);
 }
 
 export function appendSetCookies(response: Response, setCookies: readonly string[]): Response {
@@ -181,7 +181,7 @@ export function appendSetCookies(response: Response, setCookies: readonly string
 /**
  * For route handlers that Proxy does not run for (the streaming upload
  * endpoint): authenticates lazily with the same rules as Proxy, including
- * Keycloak revalidation, and applies the refreshed or cleared session cookie
+ * Authentik revalidation, and applies the refreshed or cleared session cookie
  * to whatever response the handler returns. The refreshed cookie records
  * activity at request start, when the session was validated; it never moves
  * the fixed 12-hour login boundary. A long upload can outlast a later refresh
@@ -196,9 +196,9 @@ export async function withAdminRequestSession(
   let loaded: LoadedAdminSession | undefined;
   let identity: Promise<AdminIdentity | null> | undefined;
   const authenticate = () => (identity ??= (async () => {
-    // Fail with a controlled 503 before invoking Auth.js when Keycloak
+    // Fail with a controlled 503 before invoking Auth.js when Authentik
     // configuration is absent, rather than pretending SSO was verified.
-    getKeycloakConfig();
+    getAuthentikConfig();
     loaded = await load(request.headers);
     return identityFromLoadedSession(loaded);
   })());
@@ -246,7 +246,7 @@ async function openProxyIdentity(headers: Headers, secret = process.env.AUTH_SEC
 /**
  * Identity for code that runs behind Proxy (the admin page and the CSRF
  * route). Proxy has already authenticated this request, revalidated it with
- * Keycloak when due, and persisted the cookie, so its decision is used as is:
+ * Authentik when due, and persisted the cookie, so its decision is used as is:
  * one request gets one session decision. Reading the session a second time,
  * moments later, could cross the 60-second window after Proxy had already
  * let the request through and re-issued the cookie.

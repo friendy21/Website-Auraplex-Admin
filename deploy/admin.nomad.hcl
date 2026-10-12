@@ -17,7 +17,7 @@
 # needs a further application decision, and none of it is guessed here:
 #
 #   1. Runtime secret injection is not wired (see the TODO in the task
-#      below). KEYCLOAK_CLIENT_SECRET, AUTH_SECRET and the MinIO and Qdrant
+#      below). AUTHENTIK_CLIENT_SECRET, AUTH_SECRET and the MinIO and Qdrant
 #      settings are absent.
 #   2. The host port / network mapping is not confirmed (see the network
 #      block). Only the internal application port, 3000, is.
@@ -30,14 +30,14 @@
 #      repository. They must allow request bodies of at least the 300 MB
 #      upload cap set below.
 #
-# Settled, and no longer blockers: Friendy confirmed that the Keycloak
-# callback and logout URLs he supplied are handled by the local server, so the
-# application's Auth.js routes are unchanged; and the production upload cap is
-# 300 MB.
+# Settled, and no longer blockers: the identity provider is Authentik
+# (AURA-INT-002); its provider has the redirect URI
+# <AUTH_URL>/api/auth/callback/authentik registered; and the production
+# upload cap is 300 MB.
 #
 # What is confirmed and set below: job, group, service, internal port,
 # datacenter, node, image, resources, single instance, health path, the
-# production AUTH_URL, Keycloak issuer and client ID, and the 300 MB upload
+# production AUTH_URL, Authentik issuer and client ID, and the 300 MB upload
 # cap. This is the production job only; no staging job exists.
 #
 # It deliberately does not reuse the public website's identity (its job,
@@ -56,7 +56,7 @@ job "admin-upload" {
   group "web" {
     # Single instance. Upload rate limiting, upload byte reservations, upload
     # concurrency, refresh/re-verification coordination, login ordering and
-    # the Keycloak metadata caches all live in the memory of one process and
+    # the Authentik metadata caches all live in the memory of one process and
     # are not shared. Do not raise this, and do not add canary or
     # multi-instance behaviour, until that is redesigned.
     #
@@ -101,9 +101,12 @@ job "admin-upload" {
         HOSTNAME = "0.0.0.0"
 
         # Confirmed, non-secret.
-        AUTH_URL           = "https://admin-auraplex.auraplex.info"
-        KEYCLOAK_ISSUER    = "https://keycloak.auraplex.info/realms/auraplex"
-        KEYCLOAK_CLIENT_ID = "auraplex-admin-upload"
+        AUTH_URL            = "https://admin-auraplex.auraplex.info"
+        # The trailing slash is part of Authentik's issuer.
+        AUTHENTIK_ISSUER    = "https://auth.auraplex.info/application/o/admin-upload-provider/"
+        # The OAuth client ID is public (it is in every authorization URL);
+        # gitleaks flags it only for its entropy.
+        AUTHENTIK_CLIENT_ID = "2h09nO5KV46jz53vKyWxQzMJNv6Yxu0titxQFgXN" # gitleaks:allow
 
         # Upload size, confirmed: the production cap is 300 MB.
         # ADMIN_UPLOAD_MAX_MB is the server-enforced RUNTIME cap (range
@@ -122,13 +125,12 @@ job "admin-upload" {
 
       # TODO(unresolved): runtime secret injection.
       #
-      # KEYCLOAK_CLIENT_SECRET must come from Vault at
-      #   kv/auraplex/admin-upload/keycloak_client_secret
-      # and must never be written in this file. No Vault/Nomad integration
-      # pattern exists in this repository, so none is guessed here: the KV
-      # engine version, whether the last path segment is a secret or a field,
-      # the Vault role/policy for this job and the template to use all need to
-      # come from the working Auraplex pattern.
+      # AUTHENTIK_CLIENT_SECRET must come from the Nomad variable
+      #   nomad/jobs/admin-upload, field keycloak_client_secret
+      # (the field keeps its Keycloak-era name; it holds the Authentik client
+      # secret) and must never be written in this file. The deployed job
+      # renders it, and that injection is Friendy's; it is not copied or
+      # guessed here.
       #
       # The same mechanism must also provide the inputs whose source has not
       # been supplied: AUTH_SECRET, MINIO_ENDPOINT, MINIO_ACCESS_KEY,
@@ -149,7 +151,7 @@ job "admin-upload" {
       check {
         name     = "healthz"
         type     = "http"
-        # Liveness only: public, no session, and no call to Keycloak, MinIO
+        # Liveness only: public, no session, and no call to Authentik, MinIO
         # or Qdrant. It proves the server process answers, not that those
         # services are reachable.
         path     = "/api/health"

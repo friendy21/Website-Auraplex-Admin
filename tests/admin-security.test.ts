@@ -4,7 +4,7 @@ import { UploadContractError } from '../lib/admin/upload-errors';
 import {
   canViewAllUploads,
   canUpload,
-  extractKeycloakGroups,
+  extractAuthentikGroups,
   getAdminRoleMapping,
   requireUploadPermission,
 } from '../lib/admin/server/authorization';
@@ -18,7 +18,7 @@ import { jsonAuditLogger, requestIp } from '../lib/admin/server/audit';
 import { getMinioConfig } from '../lib/admin/server/config';
 import { getAdminCsrfResponse } from '../lib/admin/server/csrf-service';
 import { authCookieConfig } from '../lib/admin/server/auth-cookies';
-import { buildKeycloakLogoutUrl, discoverKeycloakLogoutUrl, tryDiscoverKeycloakLogoutUrl } from '../lib/admin/server/keycloak-logout';
+import { buildAuthentikLogoutUrl, discoverAuthentikLogoutUrl, tryDiscoverAuthentikLogoutUrl } from '../lib/admin/server/authentik-logout';
 import { adminGuardStatus, config as proxyConfig, isProtectedAdminPath, PROXY_BYPASS_UPLOAD_PATH } from '../proxy';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -55,32 +55,34 @@ test('Uploader and Admin groups can upload with centralized mapping', () => {
   assert.equal(canUpload({ userId: 'nested', groups: ['/Admin'] }, { uploader: '/Uploader', admin: '/Admin' }), true);
 });
 
-test('Keycloak group defaults follow the task spec and remain configurable', () => {
+test('Authentik group defaults follow the task spec and remain configurable', () => {
   assert.deepEqual(getAdminRoleMapping({} as NodeJS.ProcessEnv), {
     uploader: 'auraplex-uploader',
     admin: 'auraplex-admin',
   });
   assert.deepEqual(getAdminRoleMapping({
     NODE_ENV: 'test',
-    KEYCLOAK_UPLOADER_ROLE: 'custom-uploader',
-    KEYCLOAK_ADMIN_ROLE: 'custom-admin',
+    AUTHENTIK_UPLOADER_GROUP: 'custom-uploader',
+    AUTHENTIK_ADMIN_GROUP: 'custom-admin',
   } as NodeJS.ProcessEnv), {
     uploader: 'custom-uploader',
     admin: 'custom-admin',
   });
 });
 
-test('only validated Keycloak ID-token groups grant admin access', () => {
+test('only the validated ID token\'s `groups` claim grants admin access', () => {
+  // Authentik's default profile mapping: a flat list of group names.
   const profile = {
-    groups: ['/auraplex-uploader'],
-    realm_access: { roles: ['realm-reader'] },
-    resource_access: {
-      'website-client': { roles: ['auraplex-admin'] },
-      'unrelated-client': { roles: ['unrelated-admin'] },
-    },
+    groups: ['auraplex-uploader', 'authentik Admins', 'auraplex-uploader', 42],
+    roles: ['auraplex-admin'],
+    entitlements: ['auraplex-admin'],
+    preferred_username: 'auraplex-admin',
   };
-  assert.deepEqual(extractKeycloakGroups(profile), ['/auraplex-uploader']);
-  assert.deepEqual(extractKeycloakGroups({ realm_access: { roles: ['auraplex-admin'] }, resource_access: profile.resource_access }), []);
+  assert.deepEqual(extractAuthentikGroups(profile), ['auraplex-uploader', 'authentik Admins']);
+  // Look-alike claims grant nothing.
+  assert.deepEqual(extractAuthentikGroups({ roles: profile.roles, entitlements: profile.entitlements }), []);
+  assert.deepEqual(extractAuthentikGroups({ groups: 'auraplex-admin' }), []);
+  assert.deepEqual(extractAuthentikGroups(undefined), []);
 });
 
 test('double-submit CSRF requires matching header and cookie', () => {
@@ -270,7 +272,8 @@ test('streaming upload path bypasses Proxy body cloning; other admin paths do no
   for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload']) {
     assert.equal(proxyRuns(path), true, path);
   }
-  assert.equal(proxyRuns('/api/auth/signin/keycloak'), false);
+  assert.equal(proxyRuns('/api/auth/callback/authentik'), false);
+  assert.equal(proxyRuns('/sign-in'), false);
 });
 
 function bypassedUploadRequest(headers: Record<string, string> = {}) {
@@ -369,46 +372,46 @@ test('Auth.js cookies are explicitly HttpOnly and production secure', () => {
   assert.equal(local.sessionToken.options.secure, false);
 });
 
-test('Keycloak logout URL uses discovery endpoint and server-held ID token hint', () => {
-  const url = new URL(buildKeycloakLogoutUrl({
-    issuer: 'https://sso.example.test/realms/auraplex',
+test('Authentik logout URL uses discovery endpoint and server-held ID token hint', () => {
+  const url = new URL(buildAuthentikLogoutUrl({
+    issuer: 'https://sso.example.test/application/o/admin-upload/',
     clientId: 'website',
     idToken: 'server-only-token',
-    endpoint: 'https://sso.example.test/realms/auraplex/protocol/openid-connect/logout',
+    endpoint: 'https://sso.example.test/application/o/admin-upload/end-session/',
     postLogoutRedirectUri: 'https://site.example.test/en',
   }));
   assert.equal(url.searchParams.get('id_token_hint'), 'server-only-token');
   assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/en');
-  assert.throws(() => buildKeycloakLogoutUrl({
-    issuer: 'https://sso.example.test/realms/auraplex',
+  assert.throws(() => buildAuthentikLogoutUrl({
+    issuer: 'https://sso.example.test/application/o/admin-upload/',
     clientId: 'website', idToken: 'x',
     endpoint: 'https://evil.example.test/logout',
     postLogoutRedirectUri: 'https://site.example.test/en',
   }));
 });
 
-test('Keycloak logout discovers the endpoint instead of hardcoding it', async () => {
+test('Authentik logout discovers the endpoint instead of hardcoding it', async () => {
   let requested = '';
   const fetcher = async (url: string | URL | Request) => {
     requested = String(url);
     return Response.json({
-      issuer: 'https://sso.example.test/realms/auraplex',
-      end_session_endpoint: 'https://sso.example.test/realms/auraplex/protocol/openid-connect/logout',
+      issuer: 'https://sso.example.test/application/o/admin-upload/',
+      end_session_endpoint: 'https://sso.example.test/application/o/admin-upload/end-session/',
     });
   };
-  const url = new URL(await discoverKeycloakLogoutUrl(
+  const url = new URL(await discoverAuthentikLogoutUrl(
     'server-held-token',
     fetcher as typeof fetch,
-    { issuer: 'https://sso.example.test/realms/auraplex', clientId: 'website', clientSecret: 'test-only' },
+    { issuer: 'https://sso.example.test/application/o/admin-upload/', clientId: 'website', clientSecret: 'test-only' },
     'https://site.example.test',
   ));
-  assert.equal(requested, 'https://sso.example.test/realms/auraplex/.well-known/openid-configuration');
+  assert.equal(requested, 'https://sso.example.test/application/o/admin-upload/.well-known/openid-configuration');
   assert.equal(url.searchParams.get('id_token_hint'), 'server-held-token');
   assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/signed-out');
 });
 
-test('Keycloak discovery failure falls back to local-only logout destination', async () => {
-  assert.equal(await tryDiscoverKeycloakLogoutUrl(undefined), null);
-  assert.equal(await tryDiscoverKeycloakLogoutUrl('token', async () => { throw new Error('offline'); }), null);
-  assert.equal(await tryDiscoverKeycloakLogoutUrl('token', async () => 'https://sso.example.test/logout'), 'https://sso.example.test/logout');
+test('Authentik discovery failure falls back to local-only logout destination', async () => {
+  assert.equal(await tryDiscoverAuthentikLogoutUrl(undefined), null);
+  assert.equal(await tryDiscoverAuthentikLogoutUrl('token', async () => { throw new Error('offline'); }), null);
+  assert.equal(await tryDiscoverAuthentikLogoutUrl('token', async () => 'https://sso.example.test/logout'), 'https://sso.example.test/logout');
 });

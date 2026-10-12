@@ -1,5 +1,12 @@
 # AURA-INT-001 Runtime and Deployment Notes
 
+> **AURA-INT-002.** The identity provider is now Authentik. Where these notes
+> say Keycloak, the behaviour is unchanged but the provider is Authentik: the
+> fake is `tests/helpers/fake-authentik.ts`, the modules are
+> `authentik-revalidation.ts` and `authentik-logout.ts`, and sign-in starts at
+> `/sign-in`. Provider requirements and the live checks are in
+> [AURA-INT-002-authentik.md](AURA-INT-002-authentik.md).
+
 ## Verified locally versus production
 
 Local automated tests (`npm test`) cover upload validation, the business-line → ingest-line mapping, the object-key and `source_key` contracts, Qdrant collection routing, optional Content-Length with actual byte accounting, complete stream replay after MIME inspection, server-side group/CSRF/rate-limit checks without Proxy, stable error responses, status mapping, deletion order and partial failure. They also cover:

@@ -11,16 +11,16 @@ import { authSessionCookieName } from '../lib/admin/server/auth-cookies';
 import { getUploads, putUpload } from '../lib/admin/server/upload-service';
 import { UploadConcurrencyGuard } from '../lib/admin/server/upload-concurrency';
 import { createAdminProxy } from '../proxy';
-import { createKeycloakRevalidator, RefreshSingleFlight } from '../lib/admin/server/keycloak-revalidation';
-import { createFakeKeycloak } from './helpers/fake-keycloak';
+import { createAuthentikRevalidator, RefreshSingleFlight } from '../lib/admin/server/authentik-revalidation';
+import { createFakeAuthentik } from './helpers/fake-authentik';
 
 // Test-only configuration, read at call time by Proxy and the route helper.
 // node:test runs each test file in its own process.
 const TEST_ENV = {
   AUTH_SECRET: 'test-only-auth-secret-0123456789abcdef',
-  KEYCLOAK_ISSUER: 'https://sso.example.test/realms/auraplex',
-  KEYCLOAK_CLIENT_ID: 'website-test',
-  KEYCLOAK_CLIENT_SECRET: 'test-only',
+  AUTHENTIK_ISSUER: 'https://sso.example.test/application/o/admin-upload/',
+  AUTHENTIK_CLIENT_ID: 'website-test',
+  AUTHENTIK_CLIENT_SECRET: 'test-only',
 };
 Object.assign(process.env, TEST_ENV);
 
@@ -33,24 +33,24 @@ const ABSOLUTE = ADMIN_SESSION_POLICY.absoluteLifetimeSeconds * 1000;
 const T0 = Date.UTC(2026, 8, 28, 8, 0, 0);
 const sec = (ms: number) => Math.floor(ms / 1000);
 
-const KEYCLOAK = {
-  issuer: TEST_ENV.KEYCLOAK_ISSUER,
-  clientId: TEST_ENV.KEYCLOAK_CLIENT_ID,
-  clientSecret: TEST_ENV.KEYCLOAK_CLIENT_SECRET,
+const AUTHENTIK = {
+  issuer: TEST_ENV.AUTHENTIK_ISSUER,
+  clientId: TEST_ENV.AUTHENTIK_CLIENT_ID,
+  clientSecret: TEST_ENV.AUTHENTIK_CLIENT_SECRET,
 };
-const KEYCLOAK_SUB = 'keycloak-user-1';
+const AUTHENTIK_SUB = 'authentik-user-1';
 // In-process stand-in; sessions older than the 60-second revalidation window
 // are refreshed against it. Revalidation itself is covered in
 // admin-revalidation.test.ts.
-const keycloak = createFakeKeycloak(KEYCLOAK);
+const authentik = createFakeAuthentik(AUTHENTIK);
 
 /** A real Auth.js instance with this app's config and an injectable clock. */
 function authAt(clock: { now: number }): AdminSessionLoader {
   const now = () => clock.now;
-  const loader = keycloak.then((fake) => {
+  const loader = authentik.then((fake) => {
     const coordinator = new RefreshSingleFlight();
-    const revalidator = createKeycloakRevalidator({
-      config: KEYCLOAK,
+    const revalidator = createAuthentikRevalidator({
+      config: AUTHENTIK,
       fetcher: fake.fetcher(now),
       now,
       production: false,
@@ -65,14 +65,14 @@ function authAt(clock: { now: number }): AdminSessionLoader {
 let cookieSerial = 0;
 
 async function sessionCookie(claims: Record<string, unknown>, groups = ['auraplex-uploader']) {
-  // Sessions with timestamps also carry Keycloak refresh state, last validated
+  // Sessions with timestamps also carry Authentik refresh state, last validated
   // at their last activity. Timestamp-less (legacy) tokens get none. Each
-  // cookie is its own Keycloak user, so its groups are independent.
-  const keycloakSub = `${KEYCLOAK_SUB}-${++cookieSerial}`;
+  // cookie is its own Authentik user, so its groups are independent.
+  const authentikSub = `${AUTHENTIK_SUB}-${++cookieSerial}`;
   const refreshState = typeof claims.activeAt === 'number'
     ? {
-        keycloakSub,
-        refreshToken: (await keycloak).grant(keycloakSub, groups),
+        authentikSub,
+        refreshToken: (await authentik).grant(authentikSub, groups),
         lastValidatedAt: claims.activeAt,
         browserInstanceId: `browser-${cookieSerial}`,
         loginId: `login-${cookieSerial}`,
@@ -131,8 +131,8 @@ test('Auth.js sign-in callback records the login time from the injected clock', 
   const token = await config.callbacks!.jwt!({
     token: { sub: 'user-1' },
     user: { id: 'user-1' },
-    account: { provider: 'keycloak', type: 'oidc', providerAccountId: KEYCLOAK_SUB, id_token: 'id-token', refresh_token: 'refresh-token' },
-    profile: { sub: KEYCLOAK_SUB, groups: ['auraplex-uploader'] },
+    account: { provider: 'authentik', type: 'oidc', providerAccountId: AUTHENTIK_SUB, id_token: 'id-token', refresh_token: 'refresh-token' },
+    profile: { sub: AUTHENTIK_SUB, groups: ['auraplex-uploader'] },
   } as never);
   assert.ok(token);
   assert.equal(token.loginAt, sec(T0));
@@ -306,9 +306,9 @@ test('Proxy and the upload route handler apply identical session rules', async (
 
     const page = await proxy(new NextRequest('http://admin.example.test/admin/upload', { headers: headersFor(cookie) }));
     if (expected === 401) {
-      // Expired or missing page sessions go back through Keycloak sign-in.
+      // Expired or missing page sessions go back through Authentik sign-in.
       assert.equal(page.status, 307, `page: ${name}`);
-      assert.match(page.headers.get('location') ?? '', /\/api\/auth\/signin\/keycloak\?callbackUrl=/);
+      assert.match(page.headers.get('location') ?? '', /\/sign-in\?callbackUrl=%2Fadmin%2Fupload$/);
     } else if (expected === 403) {
       assert.equal(page.status, 403);
     } else {

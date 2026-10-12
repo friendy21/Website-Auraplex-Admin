@@ -66,7 +66,7 @@ test('the health response is deterministic and exposes nothing about the environ
   const previous = { ...process.env };
   Object.assign(process.env, {
     AUTH_SECRET: marker,
-    KEYCLOAK_CLIENT_SECRET: marker,
+    AUTHENTIK_CLIENT_SECRET: marker,
     MINIO_SECRET_KEY: marker,
     QDRANT_API_KEY: marker,
   });
@@ -82,9 +82,9 @@ test('the health response is deterministic and exposes nothing about the environ
   }
 });
 
-test('the health check works with no Auth, Keycloak, MinIO or Qdrant configuration and makes no outbound request', async () => {
+test('the health check works with no Auth, Authentik, MinIO or Qdrant configuration and makes no outbound request', async () => {
   const names = [
-    'AUTH_SECRET', 'AUTH_URL', 'KEYCLOAK_ISSUER', 'KEYCLOAK_CLIENT_ID', 'KEYCLOAK_CLIENT_SECRET',
+    'AUTH_SECRET', 'AUTH_URL', 'AUTHENTIK_ISSUER', 'AUTHENTIK_CLIENT_ID', 'AUTHENTIK_CLIENT_SECRET',
     'MINIO_ENDPOINT', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'QDRANT_URL', 'QDRANT_API_KEY',
   ];
   const saved = names.map((name) => [name, process.env[name]] as const);
