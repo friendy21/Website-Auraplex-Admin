@@ -23,7 +23,7 @@ export const AUTHENTIK_REVALIDATION_TIMEOUT_MS = 5_000;
 const PROVIDER_METADATA_TTL_MS = 10 * 60_000;
 /**
  * How long a successful refresh stays reusable for requests that still carry
- * the previous cookie. Authentik rotates the refresh token on use, so a second
+ * the previous cookie. When Authentik rotates the refresh token, a second
  * redemption of the old one would fail; this covers the route handler that
  * runs after Proxy in the same request, and parallel browser requests sent
  * before the new Set-Cookie was applied.
@@ -55,7 +55,10 @@ export type AuthentikUnavailableReason = 'timeout' | 'network' | 'http-error' | 
 export type AuthentikRevalidationResult =
   | {
       status: 'ok';
-      /** The rotated refresh token Authentik issued in exchange for the old one. */
+      /**
+       * The refresh token to store: the replacement when Authentik rotated it,
+       * otherwise the one just presented, which Authentik then left valid.
+       */
       refreshToken: string;
       /** Replaces the cached groups; never merged with them. */
       groups: string[];
@@ -65,13 +68,18 @@ export type AuthentikRevalidationResult =
     }
   /** Authentik explicitly refused the grant: the session must end. */
   | { status: 'revoked' }
-  /** Authentik could not be reached or its answer could not be trusted. */
-  | { status: 'unavailable'; reason: AuthentikUnavailableReason };
+  /**
+   * Authentik could not be reached or its answer could not be trusted.
+   * `detail` names the step and check that failed (`token:no-id-token`,
+   * `id-token:ERR_JWT_CLAIM_VALIDATION_FAILED:iss`, ...) for the log line; it
+   * is drawn from a fixed vocabulary and never holds a token or claim value.
+   */
+  | { status: 'unavailable'; reason: AuthentikUnavailableReason; detail?: string };
 
 export interface AuthentikRevalidationInput {
   refreshToken: string;
   authentikSub: string;
-  /** Where this refresh token sits in its login; recorded when it is rotated. */
+  /** Where this refresh token sits in its login; recorded when it is revalidated. */
   lineage?: SessionLineage;
 }
 
@@ -94,7 +102,7 @@ function positiveNumber(value: unknown): number | null {
 
 /**
  * The ordering claims of a session token: which browser instance and login it
- * belongs to and how many times that login's refresh token has been rotated.
+ * belongs to and how many times that login has been refreshed with Authentik.
  */
 export function readSessionLineage(token: Record<string, unknown>): SessionLineage | null {
   const browserInstanceId = nonEmptyString(token.browserInstanceId);
@@ -129,8 +137,9 @@ export function readAuthentikSessionState(token: Record<string, unknown>): Authe
  * in session.ts), none of which is ever used to accept a request:
  *
  * - per login, the highest refresh generation known to exist. The generation
- *   number travels in the session token; a token whose generation is lower has
- *   a refresh token that was already redeemed.
+ *   number travels in the session token; a token whose generation is lower
+ *   holds older groups and, if Authentik rotated, a refresh token that was
+ *   already redeemed.
  * - per browser instance, the login that is current there. A sign-in replaces
  *   it and a sign-out retires it, so a response of an earlier login can be
  *   told apart from the browser's present session.
@@ -204,8 +213,9 @@ export class RefreshSingleFlight {
 
   /**
    * Records that the refresh token of `redeemed` was exchanged for the next
-   * generation of the same login. Called only for a successful, verified
-   * rotation, so a failed refresh leaves nothing behind.
+   * generation of the same login (with a rotated refresh token, or the same
+   * one when Authentik kept it). Called only for a successful, verified
+   * refresh, so a failed refresh leaves nothing behind.
    */
   recordRotation(redeemed: SessionLineage, nowMs: number): void {
     const latestGeneration = Math.max(this.logins.get(redeemed.loginId)?.latestGeneration ?? 0, redeemed.refreshGeneration + 1);
@@ -273,9 +283,26 @@ function refreshStateKey({ authentikSub, refreshToken }: AuthentikRevalidationIn
 }
 
 class Unavailable extends Error {
-  constructor(readonly reason: AuthentikUnavailableReason) {
+  constructor(readonly reason: AuthentikUnavailableReason, readonly detail: string) {
     super(reason);
   }
+}
+
+/**
+ * Shape of the provider-supplied names a `detail` may quote: an OAuth error
+ * code (`invalid_client`) or a claim name (`iss`). Anything else is left out.
+ */
+const LOGGABLE_NAME = /^[a-z_]{1,64}$/;
+
+/**
+ * The `detail` of a failure that is not an Unavailable: jose's error code (and
+ * the claim name for claim failures) when the ID token or its keys were
+ * rejected. Never the message, which can quote claim values.
+ */
+function unexpectedDetail(error: unknown): string {
+  if (!(error instanceof joseErrors.JOSEError)) return 'unexpected';
+  const claim = (error as { claim?: unknown }).claim;
+  return `id-token:${error.code}${typeof claim === 'string' && LOGGABLE_NAME.test(claim) ? `:${claim}` : ''}`;
 }
 
 interface ProviderMetadata {
@@ -305,23 +332,26 @@ export function createAuthentikRevalidator({
 }: AuthentikRevalidatorOptions): AuthentikRevalidator {
   let metadata: ProviderMetadata | null = null;
 
-  async function request(url: string, init: RequestInit, signal: AbortSignal): Promise<Response> {
+  /** Which request a failure belongs to, as the first part of its `detail`. */
+  type Step = 'discovery' | 'jwks' | 'token';
+
+  async function request(url: string, init: RequestInit, signal: AbortSignal, step: Step): Promise<Response> {
     try {
       return await fetcher(url, { ...init, cache: 'no-store', redirect: 'error', signal });
     } catch (error) {
       const name = (error as { name?: unknown } | null)?.name;
-      throw new Unavailable(name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'network');
+      throw new Unavailable(name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'network', step);
     }
   }
 
-  async function json(response: Response): Promise<Record<string, unknown>> {
+  async function json(response: Response, step: Step): Promise<Record<string, unknown>> {
     try {
       const body: unknown = await response.json();
       if (body && typeof body === 'object' && !Array.isArray(body)) return body as Record<string, unknown>;
     } catch {
       // Falls through: an unreadable body is a protocol failure.
     }
-    throw new Unavailable('protocol');
+    throw new Unavailable('protocol', `${step}:not-json`);
   }
 
   /**
@@ -332,33 +362,38 @@ export function createAuthentikRevalidator({
    * (`/application/o/token/`). The signing keys must be this provider's own,
    * under the issuer path (`<issuer>jwks/`).
    */
-  function issuerEndpoint(value: unknown, { underIssuerPath }: { underIssuerPath: boolean }): string {
+  function issuerEndpoint(
+    value: unknown,
+    { name, underIssuerPath }: { name: 'token_endpoint' | 'jwks_uri'; underIssuerPath: boolean },
+  ): string {
     const issuer = new URL(config.issuer);
     let endpoint: URL;
     try {
       endpoint = new URL(nonEmptyString(value) ?? '');
     } catch {
-      throw new Unavailable('protocol');
+      throw new Unavailable('protocol', `discovery:${name}`);
     }
     const inPath = !underIssuerPath || endpoint.pathname.startsWith(`${issuer.pathname.replace(/\/$/, '')}/`);
-    if (endpoint.origin !== issuer.origin || !inPath || (production && endpoint.protocol !== 'https:')) throw new Unavailable('protocol');
+    if (endpoint.origin !== issuer.origin || !inPath || (production && endpoint.protocol !== 'https:')) {
+      throw new Unavailable('protocol', `discovery:${name}`);
+    }
     return endpoint.toString();
   }
 
-  async function fetchJson(url: string, signal: AbortSignal): Promise<Record<string, unknown>> {
-    const response = await request(url, { headers: { accept: 'application/json' } }, signal);
-    if (!response.ok) throw new Unavailable('http-error');
-    return json(response);
+  async function fetchJson(url: string, signal: AbortSignal, step: Step): Promise<Record<string, unknown>> {
+    const response = await request(url, { headers: { accept: 'application/json' } }, signal, step);
+    if (!response.ok) throw new Unavailable('http-error', `${step}:http-${response.status}`);
+    return json(response, step);
   }
 
   async function loadMetadata(signal: AbortSignal): Promise<ProviderMetadata> {
     if (metadata && now() < metadata.expiresAt) return metadata;
-    const discovery = await fetchJson(oidcDiscoveryUrl(config.issuer), signal);
-    if (discovery.issuer !== config.issuer) throw new Unavailable('protocol');
-    const tokenEndpoint = issuerEndpoint(discovery.token_endpoint, { underIssuerPath: false });
-    const jwksUri = issuerEndpoint(discovery.jwks_uri, { underIssuerPath: true });
-    const jwks = await fetchJson(jwksUri, signal);
-    if (!Array.isArray(jwks.keys)) throw new Unavailable('protocol');
+    const discovery = await fetchJson(oidcDiscoveryUrl(config.issuer), signal, 'discovery');
+    if (discovery.issuer !== config.issuer) throw new Unavailable('protocol', 'discovery:issuer');
+    const tokenEndpoint = issuerEndpoint(discovery.token_endpoint, { name: 'token_endpoint', underIssuerPath: false });
+    const jwksUri = issuerEndpoint(discovery.jwks_uri, { name: 'jwks_uri', underIssuerPath: true });
+    const jwks = await fetchJson(jwksUri, signal, 'jwks');
+    if (!Array.isArray(jwks.keys)) throw new Unavailable('protocol', 'jwks:no-keys');
     metadata = {
       tokenEndpoint,
       jwksUri,
@@ -383,13 +418,13 @@ export function createAuthentikRevalidator({
       // jose only requires `iat` to be present; a token issued in the future
       // (beyond clock tolerance) is not a fresh answer to this request.
       if (typeof payload.iat !== 'number' || payload.iat > now() / 1000 + ID_TOKEN_CLOCK_TOLERANCE_SECONDS) {
-        throw new Unavailable('protocol');
+        throw new Unavailable('protocol', 'id-token:iat-in-future');
       }
       // OIDC Core 3.1.3.7: with several audiences `azp` must be present, and
       // whenever it is present it must be this client.
       const severalAudiences = Array.isArray(payload.aud) && payload.aud.length > 1;
       if (severalAudiences ? payload.azp !== config.clientId : payload.azp !== undefined && payload.azp !== config.clientId) {
-        throw new Unavailable('protocol');
+        throw new Unavailable('protocol', 'id-token:azp');
       }
       return payload;
     };
@@ -420,27 +455,32 @@ export function createAuthentikRevalidator({
         // No `scope`: Authentik then grants the refresh token's original
         // scopes, so `profile` (and with it `groups`) is in every new ID token.
         body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }).toString(),
-      }, signal);
+      }, signal, 'token');
 
       if (!response.ok) {
-        if (response.status >= 500) return { status: 'unavailable', reason: 'http-error' };
+        if (response.status >= 500) return { status: 'unavailable', reason: 'http-error', detail: `token:http-${response.status}` };
         // Authentik answers invalid_grant for a refresh token it does not
         // know, that has expired, or that it has revoked (rotation revokes the
         // one presented). Any other rejection (e.g. invalid_client) is a
         // deployment fault, not the user's.
-        const body = await json(response).catch(() => null);
-        return body?.error === 'invalid_grant'
-          ? { status: 'revoked' }
-          : { status: 'unavailable', reason: 'http-error' };
+        const body = await json(response, 'token').catch(() => null);
+        if (body?.error === 'invalid_grant') return { status: 'revoked' };
+        const error = typeof body?.error === 'string' && LOGGABLE_NAME.test(body.error) ? body.error : `http-${response.status}`;
+        return { status: 'unavailable', reason: 'http-error', detail: `token:${error}` };
       }
 
-      const body = await json(response);
+      const body = await json(response, 'token');
       const idToken = nonEmptyString(body.id_token);
-      // Authentik rotates the refresh token on use, so the one just presented is
-      // spent. A success without a replacement cannot be revalidated again and
-      // is not accepted; the spent token is never kept.
-      const rotatedRefreshToken = nonEmptyString(body.refresh_token);
-      if (!idToken || !rotatedRefreshToken || rotatedRefreshToken === refreshToken) throw new Unavailable('protocol');
+      if (!idToken) throw new Unavailable('protocol', 'token:no-id-token');
+      // RFC 6749 §6: a new refresh token is the server's choice. Authentik
+      // issues one, and revokes the one presented, only when that one has less
+      // than the provider's "Refresh Token threshold" left to live (on every
+      // use when the threshold is 0, its default). Otherwise the answer has no
+      // `refresh_token` and the presented token stays valid: it is kept for
+      // the next revalidation. A replacement, when sent, always takes its place.
+      const issued = body.refresh_token ?? null;
+      if (issued !== null && !nonEmptyString(issued)) throw new Unavailable('protocol', 'token:refresh-token-malformed');
+      const nextRefreshToken = (issued as string | null) ?? refreshToken;
       const claims = await verifyIdToken(idToken, authentikSub, signal);
       if (debugClaims) logIdTokenClaimShape('refresh', claims);
       const validatedAt = Math.floor(now() / 1000);
@@ -448,7 +488,7 @@ export function createAuthentikRevalidator({
       const refreshExpiresIn = positiveNumber(body.refresh_expires_in);
       return {
         status: 'ok',
-        refreshToken: rotatedRefreshToken,
+        refreshToken: nextRefreshToken,
         groups: extractAuthentikGroups(claims),
         validatedAt,
         refreshExpiresAt: refreshExpiresIn === null ? undefined : validatedAt + Math.floor(refreshExpiresIn),
@@ -456,13 +496,15 @@ export function createAuthentikRevalidator({
     } catch (error) {
       // Signature, issuer, audience, subject or expiry failures land here too:
       // an untrusted answer never yields groups.
-      return { status: 'unavailable', reason: error instanceof Unavailable ? error.reason : 'protocol' };
+      return error instanceof Unavailable
+        ? { status: 'unavailable', reason: error.reason, detail: error.detail }
+        : { status: 'unavailable', reason: 'protocol', detail: unexpectedDetail(error) };
     }
   }
 
   return (input) => singleFlight.run(refreshStateKey(input), now, async () => {
     const result = await refresh(input);
-    // Recorded before any request can see the result, so the redeemed
+    // Recorded before any request can see the result, so the refreshed
     // generation is known to be superseded from the moment it is.
     if (result.status === 'ok' && input.lineage) singleFlight.recordRotation(input.lineage, now());
     return result;

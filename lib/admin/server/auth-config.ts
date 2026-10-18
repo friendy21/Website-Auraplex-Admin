@@ -211,6 +211,7 @@ export function createAdminAuthConfig({
               type: 'admin_session_revalidation',
               outcome: 'unavailable',
               reason: result.reason,
+              ...(result.detail ? { detail: result.detail } : {}),
             }));
             report({ status: 'revalidation-unavailable' });
             // Denied without touching activeAt, lastValidatedAt or the groups.
@@ -220,6 +221,7 @@ export function createAdminAuthConfig({
           current = {
             ...token,
             groups: result.groups, // replaced, not merged: removed groups are gone
+            // Authentik's replacement, or the same token when it did not rotate.
             refreshToken: result.refreshToken,
             refreshExpiresAt: result.refreshExpiresAt,
             lastValidatedAt: result.validatedAt,

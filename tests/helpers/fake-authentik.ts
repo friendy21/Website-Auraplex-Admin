@@ -3,9 +3,10 @@ import { SignJWT, exportJWK, generateKeyPair, type JWTPayload } from 'jose';
 
 /**
  * In-process Authentik stand-in for session tests: OIDC discovery, JWKS, the
- * authorization-code leg of a login, and a refresh-token endpoint that rotates
- * the refresh token on every use. It is reached only through an injected (or
- * stubbed global) fetch; nothing here opens a socket.
+ * authorization-code leg of a login, and a refresh-token endpoint that renews
+ * the refresh token by the provider's "Refresh Token threshold" (on every use
+ * by default). It is reached only through an injected (or stubbed global)
+ * fetch; nothing here opens a socket.
  *
  * Its shapes follow Authentik 2026.2 as published by the live provider's
  * discovery document: the issuer is per provider and ends in a slash
@@ -28,10 +29,16 @@ export interface FakeAuthentikConfig {
    * `offline_access` was granted.
    */
   scopeMappings?: string[];
+  /** The provider's "Refresh Token validity", in seconds (default 30 days). */
+  refreshTokenValiditySeconds?: number;
+  /** The provider's "Refresh Token threshold", in seconds (default 0); see `refreshTokenThresholdSeconds` on the fake. */
+  refreshTokenThresholdSeconds?: number;
 }
 
 export type FakeAuthentikMode =
-  | 'ok' | 'timeout' | 'network' | 'http-5xx' | 'not-json' | 'no-id-token' | 'no-refresh-token' | 'same-refresh-token';
+  | 'ok' | 'timeout' | 'network' | 'http-5xx' | 'not-json' | 'no-id-token'
+  /** Repeats the presented refresh token instead of leaving it out; it stays valid. Not Authentik, but allowed by RFC 6749. */
+  | 'same-refresh-token';
 
 type SigningKey = Awaited<ReturnType<typeof generateKeyPair>>['privateKey'];
 
@@ -86,8 +93,14 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
   // Authentik's key ids are 32 hex characters.
   let key = await (initialKey ??= signingKey(createHash('sha256').update('test-key-1').digest('hex').slice(0, 32)));
   const users = new Map<string, { groups: string[]; enabled: boolean }>();
-  /** Live refresh tokens and the scopes granted with them. A redeemed token is removed, as with rotation. */
-  const grants = new Map<string, { sub: string; scopes: Set<string> }>();
+  /**
+   * Live refresh tokens, the scopes granted with them and when they expire
+   * (epoch seconds). A token is removed when a renewal revokes it.
+   */
+  const grants = new Map<string, { sub: string; scopes: Set<string>; expiresAt: number }>();
+  const validitySeconds = config.refreshTokenValiditySeconds ?? 30 * 24 * 3600;
+  /** The clock grants are issued by: the one the fetcher was created with, once it has been. */
+  let clock: () => number = Date.now;
   /** Unredeemed authorization codes. */
   const codes = new Map<string, { sub: string; scopes: Set<string>; redirectUri: string; codeChallenge: string; nonce: string | null }>();
   let serial = 0;
@@ -103,7 +116,7 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
   /** Authentik refresh tokens are 128 random characters; the size matters for cookie and header limits. */
   function newRefreshToken(sub: string, scopes: Set<string>): string {
     const refreshToken = `${++serial}-${randomBytes(96).toString('base64url')}`.slice(0, 128);
-    grants.set(refreshToken, { sub, scopes });
+    grants.set(refreshToken, { sub, scopes, expiresAt: Math.floor(clock() / 1000) + validitySeconds });
     return refreshToken;
   }
 
@@ -154,6 +167,16 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
     forgeSignature: false,
     /** Alters the discovery document before it is served. */
     tamperDiscovery: null as null | ((discovery: Record<string, unknown>) => Record<string, unknown>),
+    /** Alters a successful refresh answer before it is sent. */
+    tamperRefreshResponse: null as null | ((body: Record<string, unknown>) => Record<string, unknown>),
+    /**
+     * The provider's "Refresh Token threshold", in seconds. As in Authentik's
+     * token view, a refresh renews the refresh token (and revokes the one
+     * presented) only when that one has less than this left to live, or always
+     * when it is 0. Otherwise the answer has no `refresh_token` and the
+     * presented token stays valid.
+     */
+    refreshTokenThresholdSeconds: config.refreshTokenThresholdSeconds ?? 0,
 
     /** Registers (or updates) a user and returns a live refresh token with every scope. */
     grant(sub: string, groups: string[]): string {
@@ -204,6 +227,7 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
     },
 
     fetcher(now: () => number): typeof fetch {
+      clock = now;
       return async (input, init) => {
         const url = String(input instanceof Request ? input.url : input);
         if (url === endpoints.discovery) {
@@ -257,24 +281,31 @@ export async function createFakeAuthentik(config: FakeAuthentikConfig) {
 
         const grant = grants.get(presented);
         const user = grant ? users.get(grant.sub) : undefined;
-        if (form.get('grant_type') !== 'refresh_token' || !grant || !user?.enabled) return invalidGrant();
-        // Rotation: the presented token is revoked and a new one issued with
+        if (form.get('grant_type') !== 'refresh_token' || !grant || grant.expiresAt <= nowSeconds || !user?.enabled) {
+          return invalidGrant();
+        }
+        // Renewal: the presented token is revoked and a new one issued with
         // the same scopes (no `scope` in the request means the original ones).
-        grants.delete(presented);
-        const refreshToken = newRefreshToken(grant.sub, grant.scopes);
+        const threshold = fake.refreshTokenThresholdSeconds;
+        let renewed: string | null = null;
+        if (fake.mode !== 'same-refresh-token' && (threshold === 0 || grant.expiresAt - nowSeconds < threshold)) {
+          grants.delete(presented);
+          renewed = newRefreshToken(grant.sub, grant.scopes);
+        }
 
         await fake.duringTokenRequest?.();
         if (fake.mode === 'not-json') return new Response('<html>gateway</html>', { status: 200 });
 
         const idToken = await signIdToken(idTokenClaims(grant.sub, grant.scopes, nowSeconds, null));
-        return json({
+        const body = {
           access_token: `access-${serial}`,
           token_type: 'Bearer',
           scope: [...grant.scopes].join(' '),
           expires_in: 300,
-          ...(fake.mode === 'no-refresh-token' ? {} : { refresh_token: fake.mode === 'same-refresh-token' ? presented : refreshToken }),
           ...(fake.mode === 'no-id-token' ? {} : { id_token: idToken }),
-        });
+          ...(renewed ? { refresh_token: renewed } : fake.mode === 'same-refresh-token' ? { refresh_token: presented } : {}),
+        };
+        return json(fake.tamperRefreshResponse ? fake.tamperRefreshResponse(body) : body);
       };
     },
   };

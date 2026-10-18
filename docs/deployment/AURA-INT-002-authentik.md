@@ -2,7 +2,8 @@
 
 The identity provider is Authentik 2026.2.3 at `https://auth.auraplex.info`.
 The session design is unchanged: the 30-minute idle and 12-hour absolute
-limits, the 60-second refresh-token revalidation with mandatory rotation,
+limits, the 60-second refresh-token revalidation (rotation as Authentik's
+Refresh Token threshold decides, see below),
 group-based authorization in Proxy and in every handler, and RP-initiated
 logout. Only the identity-provider wiring changed.
 
@@ -115,6 +116,48 @@ callback (a reload, back/forward, a retry) presents the spent code.
 - Recommended for ops regardless: `proxy_buffer_size 16k; proxy_buffers 8 16k;`
   on the ingress, as headroom.
 
+## Follow-up: first upload refused with "could not be re-verified"
+
+After sign-in worked, the first upload (the first request once the session's
+last validation was 60 seconds old) got 503 `IDENTITY_PROVIDER_UNAVAILABLE`,
+logged as `{"type":"admin_session_revalidation","outcome":"unavailable","reason":"protocol"}`.
+A refresh-token grant made by hand from the container, with the session's
+refresh token and the same client credentials, returned 200.
+
+**Cause: the app required a new refresh token in every refresh answer;
+Authentik does not always send one.** Authentik's token view renews a refresh
+token, and revokes the one presented, only when that token has less than the
+provider's **Refresh Token threshold** left to live (always when the threshold
+is `seconds=0`, the default). Otherwise the answer has an access token and an
+ID token but **no `refresh_token`**, and the presented token stays valid
+(RFC 6749 §6 leaves a new refresh token to the server). The revalidator treated
+that answer as a protocol failure, so every revalidation failed the same way
+and the token was never spent, which is why the manual grant still succeeded.
+Discovery, the JWKS (one RS256 key), client authentication (`client_secret_basic`)
+and the request body (`grant_type` and `refresh_token` only, no `redirect_uri`
+or `scope`) were all correct. With this code an `invalid_grant` from Authentik
+ends the session (401); it is never logged as `unavailable`/`protocol`.
+
+**Fix**
+
+- An answer without `refresh_token` (or repeating the presented one) is a
+  successful revalidation; the presented token is kept in the session. When
+  Authentik does send a new one it replaces the stored token in the re-issued
+  cookie, as before, and the revoked one is never presented again.
+- A `refresh_token` that is present but not a non-empty string is still a
+  protocol failure, and so is any ID-token problem.
+- The `admin_session_revalidation` log line now carries a `detail` naming the
+  step and check that failed, so `protocol` is no longer a dead end, for
+  example `token:no-id-token`, `token:refresh-token-malformed`,
+  `id-token:ERR_JWT_CLAIM_VALIDATION_FAILED:iss`, `discovery:issuer`,
+  `token:invalid_client`, `token:http-503`. It never contains a token or a
+  claim value.
+
+**Confirming on the live system:** sign in, wait more than 60 seconds, upload a
+PDF for a machines product. The upload succeeds, the object appears as
+`auraplex-raw-pdf/machines/<slug>/<file>`, and there is no
+`admin_session_revalidation` line. If one appears, its `detail` names the cause.
+
 ## Deployment: environment of the deployed job
 
 | Before | After | Value |
@@ -140,6 +183,7 @@ variables. `/api/health` stays green either way.
 | Include claims in id_token | on | Not visible from outside; check 3 below confirms it. |
 | Signing key | RS256 | Present: one RS256 key in the JWKS. |
 | Client authentication | `client_secret_basic` | Supported per discovery. |
+| Refresh Token validity / threshold | any; `seconds=0` threshold recommended | Not visible from outside. With threshold `seconds=0` every revalidation rotates the refresh token (a copied token stops working at the next refresh). With a larger threshold Authentik keeps the token until it nears expiry; the app accepts both. |
 | Post-logout redirect | `https://admin-auraplex.auraplex.info/signed-out` accepted | Not visible from outside; check 6. |
 | Invalidation flow | contains a User Logout stage (for example `default-invalidation-flow`) | Not visible from outside; check 6. Authentik's default provider invalidation flow is expected not to end the Authentik session. |
 | Application binding | group bindings for `auraplex-uploader` and `auraplex-admin`, policy engine mode ANY | Confirmed in the ticket. |

@@ -43,7 +43,7 @@ Authentik, MinIO, Qdrant, APISIX, Cloudflare Tunnel or Nomad.**
   itself so that large bodies are streamed rather than buffered.
 - **Session rules.** 30-minute idle timeout, 12-hour absolute lifetime, and
   re-verification with Authentik once the last verification is 60 seconds old,
-  with mandatory refresh-token rotation. What happens when a re-verification
+  storing the rotated refresh token whenever Authentik issues one. What happens when a re-verification
   does not succeed depends on why; see
   [Re-verification outcomes](#re-verification-outcomes).
 - **Upload contract.** Object key `{ingest_line}/{product.slug}/{sanitized_filename}`,
@@ -197,7 +197,7 @@ document, `<issuer>.well-known/openid-configuration`; none is configured.
 | Client authentication | Confidential client with a secret; the token endpoint is called with HTTP Basic (`client_secret_basic`). |
 | Scopes requested | `openid email profile offline_access` |
 | Scope mappings on the provider | `openid`, `email`, `profile` **and `offline_access`**. Authentik issues a refresh token only for `offline_access`, and silently drops a requested scope that has no mapping. Without it every sign-in is refused, logged as `admin_sign_in` / `no-refresh-token`. |
-| Refresh tokens | Issued at sign-in and **rotated on every use**. A refresh that returns no new token is treated as a failure. |
+| Refresh tokens | Issued at sign-in. Rotated on use when the provider's Refresh Token threshold is `seconds=0` (recommended); with a larger threshold Authentik answers without a new token and the current one stays valid. Both are accepted. |
 | ID token claims | "Include claims in id_token" stays on: `groups` (the default `profile` mapping, the names of the user's groups) must be in the ID token at sign-in and on every refresh. Access is decided by group membership only. A user who is only in a child group of `auraplex-admin` is not listed under that name. |
 | Signing key | An RS256 key, published in the provider's JWKS. |
 | Subject mode | Leave as configured: `sub` is the key for upload ownership, so changing the subject mode later detaches users from their uploads. |
@@ -229,7 +229,7 @@ anything privileged runs. The result of that call decides what happens:
 | Authentik outcome | Result |
 | --- | --- |
 | Authentik cannot be reached, times out, answers with a server error, or rejects the request for a reason other than the refresh token itself (for example a client misconfiguration) | Fail closed: **503** `IDENTITY_PROVIDER_UNAVAILABLE`. The stored groups are not used. The session cookie is left as it is, so the browser can retry. |
-| The response is malformed, carries no new refresh token, or its ID token fails verification | The same **503**. Nothing from the response is trusted. |
+| The response is malformed or its ID token fails verification | The same **503**. Nothing from the response is trusted. The log line's `detail` names the failed check. |
 | Authentik explicitly rejects the refresh token (`invalid_grant`: the token is unknown, expired or revoked; ending the user's Authentik session or deactivating the user is expected to cause this, to be confirmed live per [AURA-INT-002](AURA-INT-002-authentik.md)) | The session is no longer valid: the local session is cleared, APIs answer **401** `UNAUTHENTICATED`, pages redirect to sign-in, and the user must authenticate again. |
 | The refresh succeeds but the fresh groups no longer include a required group | Access is denied: **403** `FORBIDDEN`. (If Authentik itself refuses the refresh because the user no longer passes the application binding, the row above applies instead.) |
 
@@ -658,7 +658,7 @@ registered for its own host. The comparison is in
 [Authentik callback and logout URIs](#authentik-callback-and-logout-uris).
 
 The provider must also issue refresh tokens (the `offline_access` scope
-mapping), rotate them on every use, and put `groups` in the ID token; see
+mapping) and put `groups` in the ID token; see
 [Authentik provider](#authentik-provider).
 
 ### G6. Networking

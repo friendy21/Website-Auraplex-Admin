@@ -408,30 +408,35 @@ for (const mode of ['timeout', 'network', 'http-5xx'] as const) {
 }
 
 test('malformed or untrusted token responses are denied and never restore stale groups', async () => {
-  const cases: Array<{ name: string; arrange: (ak: Awaited<ReturnType<typeof setup>>['ak']) => void }> = [
-    { name: 'not JSON', arrange: (ak) => { ak.mode = 'not-json' satisfies FakeAuthentikMode; } },
-    { name: 'no ID token', arrange: (ak) => { ak.mode = 'no-id-token'; } },
-    { name: 'forged signature', arrange: (ak) => { ak.forgeSignature = true; } },
-    { name: 'wrong issuer', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iss: 'https://evil.example.test/application/o/admin-upload/' }); } },
-    { name: 'issuer without its trailing slash', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iss: AUTHENTIK.issuer.replace(/\/$/, '') }); } },
-    { name: 'another provider of the same Authentik', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iss: 'https://sso.example.test/application/o/other-app/' }); } },
-    { name: 'wrong audience', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, aud: 'another-client', azp: 'another-client' }); } },
-    { name: 'wrong authorized party', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, aud: [AUTHENTIK.clientId, 'another-client'], azp: 'another-client' }); } },
-    { name: 'different subject', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, sub: 'authentik-sub-2' }); } },
-    { name: 'expired', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iat: claims.iat! - 600, exp: claims.iat! - 300 }); } },
-    { name: 'no expiry', arrange: (ak) => { ak.tamper = ({ exp: _exp, ...claims }) => claims; } },
+  const claimFailed = (claim: string) => `id-token:ERR_JWT_CLAIM_VALIDATION_FAILED:${claim}`;
+  const cases: Array<{ name: string; arrange: (ak: Awaited<ReturnType<typeof setup>>['ak']) => void; detail: string }> = [
+    { name: 'not JSON', arrange: (ak) => { ak.mode = 'not-json' satisfies FakeAuthentikMode; }, detail: 'token:not-json' },
+    { name: 'no ID token', arrange: (ak) => { ak.mode = 'no-id-token'; }, detail: 'token:no-id-token' },
+    { name: 'forged signature', arrange: (ak) => { ak.forgeSignature = true; }, detail: 'id-token:ERR_JWS_SIGNATURE_VERIFICATION_FAILED' },
+    { name: 'wrong issuer', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iss: 'https://evil.example.test/application/o/admin-upload/' }); }, detail: claimFailed('iss') },
+    { name: 'issuer without its trailing slash', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iss: AUTHENTIK.issuer.replace(/\/$/, '') }); }, detail: claimFailed('iss') },
+    { name: 'another provider of the same Authentik', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iss: 'https://sso.example.test/application/o/other-app/' }); }, detail: claimFailed('iss') },
+    { name: 'wrong audience', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, aud: 'another-client', azp: 'another-client' }); }, detail: claimFailed('aud') },
+    { name: 'wrong authorized party', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, aud: [AUTHENTIK.clientId, 'another-client'], azp: 'another-client' }); }, detail: 'id-token:azp' },
+    { name: 'different subject', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, sub: 'authentik-sub-2' }); }, detail: claimFailed('sub') },
+    { name: 'expired', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, iat: claims.iat! - 600, exp: claims.iat! - 300 }); }, detail: 'id-token:ERR_JWT_EXPIRED:exp' },
+    { name: 'no expiry', arrange: (ak) => { ak.tamper = ({ exp: _exp, ...claims }) => claims; }, detail: claimFailed('exp') },
+    { name: 'malformed refresh token', arrange: (ak) => { ak.tamperRefreshResponse = (body) => ({ ...body, refresh_token: 42 }); }, detail: 'token:refresh-token-malformed' },
   ];
-  for (const { name, arrange } of cases) {
+  for (const { name, arrange, detail } of cases) {
     const { ak, load, cookie } = await setup();
     const { header } = await cookie({ groups: ['auraplex-uploader', 'auraplex-admin'] });
     // Even a response that claims admin must not be believed.
     arrange(ak);
+    warnings.length = 0;
 
     const put = await upload(load, header);
     assert.equal(put.response.status, 503, name);
     assert.equal(await code(put.response), 'IDENTITY_PROVIDER_UNAVAILABLE', name);
     assert.equal(put.puts, 0, name);
     assert.deepEqual(put.response.headers.getSetCookie(), [], name);
+    // The log names the check that failed, so "protocol" is never a dead end.
+    assert.deepEqual(JSON.parse(warnings[0]), { type: 'admin_session_revalidation', outcome: 'unavailable', reason: 'protocol', detail }, name);
     const loaded = await load(headersFor(header));
     assert.equal(loaded.session, null, name);
   }
@@ -1884,7 +1889,7 @@ test('provider tokens never appear in the browser session JSON or in logs', asyn
   const unavailableBody = await unavailable.text();
   assert.deepEqual(Object.keys(JSON.parse(unavailableBody) as object).sort(), ['expires', REVALIDATION_UNAVAILABLE_FLAG]);
   assert.equal(warnings.length, 1);
-  assert.deepEqual(JSON.parse(warnings[0]), { type: 'admin_session_revalidation', outcome: 'unavailable', reason: 'network' });
+  assert.deepEqual(JSON.parse(warnings[0]), { type: 'admin_session_revalidation', outcome: 'unavailable', reason: 'network', detail: 'token' });
   for (const secret of secrets) {
     assert.equal(unavailableBody.includes(secret), false);
     assert.equal(warnings[0].includes(secret), false);
@@ -1907,30 +1912,26 @@ test('sessions from before revalidation must sign in again', async () => {
   assert.equal(ak.calls.token, 0);
 });
 
-// --- Refresh-token rotation is mandatory -------------------------------------
+// --- Refresh-token rotation is the provider's choice --------------------------
+// (Authentik's own "Refresh Token threshold": see the AURA-INT-002 section.)
 
-for (const mode of ['no-refresh-token', 'same-refresh-token'] as const) {
-  test(`a refresh answer with ${mode} is a protocol failure, not a validation`, async () => {
-    const { ak, load, cookie } = await setup();
-    const { header, refreshToken } = await cookie({ groups: ['auraplex-uploader', 'auraplex-admin'] });
-    ak.mode = mode;
+test('a refresh answer that repeats the presented refresh token is a validation, and that token is kept', async () => {
+  const { clock, ak, load, cookie } = await setup();
+  const { header, refreshToken } = await cookie();
+  ak.mode = 'same-refresh-token';
 
-    const put = await upload(load, header);
-    assert.equal(put.response.status, 503);
-    assert.equal(await code(put.response), 'IDENTITY_PROVIDER_UNAVAILABLE');
-    assert.equal(put.puts, 0);
-    // No cookie: lastValidatedAt is not moved and no token is stored.
-    assert.deepEqual(put.response.headers.getSetCookie(), []);
+  const put = await upload(load, header);
+  assert.equal(put.response.status, 200);
+  assert.equal(put.puts, 1);
+  const token = await reissued(put.response.headers.getSetCookie());
+  assert.equal(token?.refreshToken, refreshToken);
+  assert.equal(token?.lastValidatedAt, sec(clock.now));
 
-    // The presented token is spent. It is not treated as still usable: the
-    // next attempt is refused by Authentik and the session ends.
-    ak.mode = 'ok';
-    const retry = await load(headersFor(header));
-    assert.equal(retry.session, null);
-    assert.ok(clearsSession(retry.setCookies));
-    assert.deepEqual(ak.presented, [refreshToken, refreshToken]);
-  });
-}
+  clock.now += WINDOW;
+  const next = await load(headersFor(nextCookie(put.response.headers.getSetCookie())!));
+  assert.notEqual(next.session, null);
+  assert.deepEqual(ak.presented, [refreshToken, refreshToken]);
+});
 
 test('every successful refresh stores a new token and no redeemed token is presented again', async () => {
   const { clock, ak, load, cookie } = await setup();
@@ -2280,4 +2281,115 @@ test('the Authentik subject reaches Proxy-covered handlers without entering the 
   assert.equal((JSON.parse(body) as { user: { id: string } }).user.id, 'authjs-login-uuid-A');
   assert.equal(body.includes(AK_SUB), false);
   assert.equal(JSON.stringify(loaded.session).includes(AK_SUB), false);
+});
+
+// --- AURA-INT-002: Authentik's "Refresh Token threshold" ----------------------
+//
+// Authentik renews a refresh token only when it has less than the provider's
+// threshold left to live (always when the threshold is 0). Otherwise its answer
+// has an access and an ID token but no refresh_token, and the presented token
+// stays valid. Rejecting that answer turned every 60-second revalidation into
+// unavailable/protocol, so the first upload after sign-in was refused with 503.
+
+/** "days=1", against Authentik's 30-day refresh-token validity. */
+const REFRESH_THRESHOLD_SECONDS = 24 * 3600;
+
+const revalidationLog = () => warnings
+  .filter((line) => line.includes('admin_session_revalidation'))
+  .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+test('AURA-INT-002: an unrotated refresh is a validation, and the upload is streamed to storage', async () => {
+  const { clock, ak, load, cookie } = await setup();
+  ak.refreshTokenThresholdSeconds = REFRESH_THRESHOLD_SECONDS;
+  const memory = memoryStorage();
+  const { header, refreshToken } = await cookie();
+  warnings.length = 0;
+
+  const put = await putInto(memory, load, header, 'brochure.pdf');
+  assert.equal(put.status, 200);
+  assert.deepEqual(
+    memory.objects.map(({ bucket, key }) => `${bucket}/${key}`),
+    ['auraplex-raw-pdf/machines/flexy-applicator/brochure.pdf'],
+  );
+  assert.deepEqual(revalidationLog(), []);
+  // Authentik sent no refresh token and left the presented one valid: it is kept.
+  const token = await reissued(put.headers.getSetCookie());
+  assert.equal(token?.refreshToken, refreshToken);
+  assert.equal(token?.lastValidatedAt, sec(clock.now));
+  assert.equal(token?.refreshGeneration, 1);
+
+  // At the next revalidation the same token is presented, and accepted, again.
+  clock.now += WINDOW;
+  const again = await putInto(memory, load, nextCookie(put.headers.getSetCookie())!, 'manual.pdf');
+  assert.equal(again.status, 200);
+  assert.equal(memory.objects.length, 2);
+  assert.deepEqual(ak.presented, [refreshToken, refreshToken]);
+  assert.equal((await reissued(again.headers.getSetCookie()))?.refreshGeneration, 2);
+});
+
+test('AURA-INT-002: once Authentik rotates, the new refresh token is persisted and the revoked one fails closed', async () => {
+  const { clock, ak, load, cookie } = await setup();
+  ak.refreshTokenThresholdSeconds = REFRESH_THRESHOLD_SECONDS;
+  const memory = memoryStorage();
+  const { header, refreshToken } = await cookie();
+
+  const first = await putInto(memory, load, header, 'first.pdf');
+  assert.equal(first.status, 200);
+  const firstCookie = nextCookie(first.headers.getSetCookie())!;
+  assert.equal((await reissued(first.headers.getSetCookie()))?.refreshToken, refreshToken);
+
+  // The token is now within the threshold, as near the end of its validity:
+  // Authentik issues a new one and revokes the one presented.
+  ak.refreshTokenThresholdSeconds = 31 * 24 * 3600;
+  clock.now += WINDOW;
+  const second = await putInto(memory, load, firstCookie, 'second.pdf');
+  assert.equal(second.status, 200);
+  const rotated = (await reissued(second.headers.getSetCookie()))?.refreshToken as string;
+  assert.ok(rotated && rotated !== refreshToken, 'the re-issued cookie carries the rotated refresh token');
+
+  clock.now += WINDOW;
+  const third = await putInto(memory, load, nextCookie(second.headers.getSetCookie())!, 'third.pdf');
+  assert.equal(third.status, 200);
+  assert.deepEqual(ak.presented, [refreshToken, refreshToken, rotated], 'the next revalidation uses the rotated token');
+
+  // A cookie that still holds the revoked token is refused, and nothing is stored.
+  const stale = await putInto(memory, load, firstCookie, 'stale.pdf');
+  assert.equal(stale.status, 401);
+  assert.deepEqual(memory.objects.map(({ key }) => key.split('/').at(-1)), ['first.pdf', 'second.pdf', 'third.pdf']);
+});
+
+test('AURA-INT-002: an unrotated answer that cannot be trusted is a 503, and the kept token still works afterwards', async () => {
+  type Ak = Awaited<ReturnType<typeof setup>>['ak'];
+  const cases: Array<{ name: string; arrange: (ak: Ak) => void; detail: string }> = [
+    { name: 'forged ID token', arrange: (ak) => { ak.forgeSignature = true; }, detail: 'id-token:ERR_JWS_SIGNATURE_VERIFICATION_FAILED' },
+    { name: 'ID token for another subject', arrange: (ak) => { ak.tamper = (claims) => ({ ...claims, sub: 'authentik-sub-2' }); }, detail: 'id-token:ERR_JWT_CLAIM_VALIDATION_FAILED:sub' },
+    { name: 'empty refresh token', arrange: (ak) => { ak.tamperRefreshResponse = (body) => ({ ...body, refresh_token: '' }); }, detail: 'token:refresh-token-malformed' },
+  ];
+  for (const { name, arrange, detail } of cases) {
+    const { ak, load, cookie } = await setup();
+    ak.refreshTokenThresholdSeconds = REFRESH_THRESHOLD_SECONDS;
+    const memory = memoryStorage();
+    // Even an answer that claims admin must not be believed.
+    const { header, refreshToken } = await cookie({ groups: ['auraplex-uploader', 'auraplex-admin'] });
+    arrange(ak);
+    warnings.length = 0;
+
+    const denied = await putInto(memory, load, header, 'denied.pdf');
+    assert.equal(denied.status, 503, name);
+    assert.equal(await code(denied), 'IDENTITY_PROVIDER_UNAVAILABLE', name);
+    assert.deepEqual(memory.objects, [], `${name}: nothing reaches storage`);
+    assert.deepEqual(denied.headers.getSetCookie(), [], `${name}: the cookie is left as it is`);
+    assert.deepEqual(revalidationLog(), [{ type: 'admin_session_revalidation', outcome: 'unavailable', reason: 'protocol', detail }], name);
+    assert.equal(warnings.some((line) => line.includes(refreshToken)), false, `${name}: no token in the log`);
+
+    // Authentik did not revoke the presented token, so the same cookie
+    // succeeds as soon as Authentik's answer can be trusted again.
+    ak.forgeSignature = false;
+    ak.tamper = null;
+    ak.tamperRefreshResponse = null;
+    const retried = await putInto(memory, load, header, 'retried.pdf');
+    assert.equal(retried.status, 200, name);
+    assert.equal(memory.objects.length, 1, name);
+    assert.deepEqual(ak.presented, [refreshToken, refreshToken], name);
+  }
 });

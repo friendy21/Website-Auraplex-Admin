@@ -20,7 +20,7 @@ export interface SessionLineage {
   browserInstanceId: string;
   /** Random id of one Authentik sign-in; fixed for the life of that login. */
   loginId: string;
-  /** 0 at sign-in, +1 on every refresh-token rotation of that login. */
+  /** 0 at sign-in, +1 on every successful Authentik refresh of that login (rotated or not). */
   refreshGeneration: number;
 }
 
