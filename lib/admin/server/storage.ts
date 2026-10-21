@@ -47,6 +47,11 @@ export interface StorageAdapter {
   deleteObject(bucket: UploadBucket, key: string): Promise<void>;
 }
 
+/** S3/MinIO answered that the bucket does not exist (e.g. not created yet for a new file type). */
+export function isMissingBucketError(error: unknown): boolean {
+  return (error as { name?: unknown } | null)?.name === 'NoSuchBucket';
+}
+
 /**
  * Unknown-length bodies use lib-storage multipart upload because single-part
  * PutObject needs a length up front (the SDK's aws-chunked checksum framing

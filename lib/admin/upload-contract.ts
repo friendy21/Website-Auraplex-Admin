@@ -144,21 +144,46 @@ export interface UploadObjectLocation {
 
 export type UploadBucket =
   | 'auraplex-raw-pdf'
+  | 'auraplex-raw-docs'
   | 'auraplex-raw-image'
   | 'auraplex-raw-video';
 
 export const UPLOAD_BUCKETS: readonly UploadBucket[] = [
   'auraplex-raw-pdf',
+  'auraplex-raw-docs',
   'auraplex-raw-image',
   'auraplex-raw-video',
 ];
 
+/**
+ * How the server confirms that the content is the declared type
+ * (lib/admin/server/mime-sniff.ts):
+ *
+ * - `signature`: file-type identifies exactly `canonicalMimeType` from the
+ *   first bytes.
+ * - `compound-file`: a Microsoft Compound File, the container of the Office
+ *   97-2003 formats, recognised from its first bytes, that holds one of
+ *   `streams` (looked for anywhere in the file). This is what tells a Word,
+ *   Excel and PowerPoint file apart.
+ * - `text`: plain text has no signature; no byte of the file may be binary.
+ */
+export type UploadContentCheck =
+  | { kind: 'signature' }
+  | { kind: 'compound-file'; streams: readonly string[] }
+  | { kind: 'text' };
+
 export interface UploadMediaRoute {
   bucket: UploadBucket;
+  /** Buckets this type was stored in before; objects there stay listed and deletable. */
+  legacyBuckets?: readonly UploadBucket[];
   canonicalMimeType: string;
   acceptedExtensions: readonly string[];
   ingestionCapability: 'supported' | 'deferred';
+  content: UploadContentCheck;
 }
+
+const SIGNATURE = { kind: 'signature' } as const;
+const TEXT = { kind: 'text' } as const;
 
 export const UPLOAD_MEDIA_ROUTES: Readonly<Record<string, UploadMediaRoute>> = {
   'application/pdf': {
@@ -166,33 +191,96 @@ export const UPLOAD_MEDIA_ROUTES: Readonly<Record<string, UploadMediaRoute>> = {
     canonicalMimeType: 'application/pdf',
     acceptedExtensions: ['pdf'],
     ingestionCapability: 'supported',
+    content: SIGNATURE,
   },
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
-    bucket: 'auraplex-raw-pdf',
+    bucket: 'auraplex-raw-docs',
+    // Stored with the PDFs until documents got their own bucket.
+    legacyBuckets: ['auraplex-raw-pdf'],
     canonicalMimeType:
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     acceptedExtensions: ['docx'],
     ingestionCapability: 'deferred',
+    content: SIGNATURE,
+  },
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    acceptedExtensions: ['xlsx'],
+    ingestionCapability: 'deferred',
+    content: SIGNATURE,
+  },
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    acceptedExtensions: ['pptx'],
+    ingestionCapability: 'deferred',
+    content: SIGNATURE,
+  },
+  'application/msword': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'application/msword',
+    acceptedExtensions: ['doc'],
+    ingestionCapability: 'deferred',
+    content: { kind: 'compound-file', streams: ['WordDocument'] },
+  },
+  'application/vnd.ms-excel': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'application/vnd.ms-excel',
+    acceptedExtensions: ['xls'],
+    ingestionCapability: 'deferred',
+    // `Book` is the Excel 5.0/95 name of the workbook stream; some writers
+    // use upper case (the same names Apache POI accepts).
+    content: { kind: 'compound-file', streams: ['Workbook', 'WORKBOOK', 'Book', 'BOOK'] },
+  },
+  'application/vnd.ms-powerpoint': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'application/vnd.ms-powerpoint',
+    acceptedExtensions: ['ppt'],
+    ingestionCapability: 'deferred',
+    content: { kind: 'compound-file', streams: ['PowerPoint Document'] },
+  },
+  'text/csv': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'text/csv',
+    acceptedExtensions: ['csv'],
+    ingestionCapability: 'deferred',
+    content: TEXT,
+  },
+  'text/plain': {
+    bucket: 'auraplex-raw-docs',
+    canonicalMimeType: 'text/plain',
+    acceptedExtensions: ['txt'],
+    ingestionCapability: 'deferred',
+    content: TEXT,
   },
   'image/png': {
     bucket: 'auraplex-raw-image',
     canonicalMimeType: 'image/png',
     acceptedExtensions: ['png'],
     ingestionCapability: 'deferred',
+    content: SIGNATURE,
   },
   'image/jpeg': {
     bucket: 'auraplex-raw-image',
     canonicalMimeType: 'image/jpeg',
     acceptedExtensions: ['jpg', 'jpeg'],
     ingestionCapability: 'deferred',
+    content: SIGNATURE,
   },
   'video/mp4': {
     bucket: 'auraplex-raw-video',
     canonicalMimeType: 'video/mp4',
     acceptedExtensions: ['mp4'],
     ingestionCapability: 'deferred',
+    content: SIGNATURE,
   },
 };
+
+/** Whether objects of this type belong in `bucket`: its own, or one it was stored in before. */
+export function uploadMediaStoredIn(route: UploadMediaRoute, bucket: string): boolean {
+  return route.bucket === bucket || (route.legacyBuckets ?? []).includes(bucket as UploadBucket);
+}
 
 export const ACCEPTED_UPLOAD_EXTENSIONS = Object.freeze(
   Array.from(

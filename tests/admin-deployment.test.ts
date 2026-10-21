@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { ADMIN_SIGNED_OUT_PATH } from '../lib/admin/admin-routes';
+import { UPLOAD_BUCKETS } from '../lib/admin/upload-contract';
 
 // Static checks on the deployment configuration: the values Friendy confirmed
 // are wired in, no secret value is committed, and the items that are still
@@ -393,4 +394,14 @@ test('the image still runs as the unprivileged node user', () => {
   const dockerfile = read('Dockerfile');
   assert.match(dockerfile, /^USER node$/m);
   assert.equal([...dockerfile.matchAll(/^COPY --from=builder --chown=node:node /gm)].length, 3);
+});
+
+test('the documented MinIO policy grants exactly the buckets the app uses', () => {
+  const policy = JSON.parse(read('docs', 'deployment', 'minio-admin-upload-policy.json')) as {
+    Statement: Array<{ Sid: string; Resource: string[] }>;
+  };
+  const resources = (sid: string) => policy.Statement.find((statement) => statement.Sid === sid)?.Resource.slice().sort();
+  const buckets = [...UPLOAD_BUCKETS].sort();
+  assert.deepEqual(resources('ListAdminUploadBuckets'), buckets.map((bucket) => `arn:aws:s3:::${bucket}`));
+  assert.deepEqual(resources('ReadAndWriteAdminUploadObjects'), buckets.map((bucket) => `arn:aws:s3:::${bucket}/*`));
 });

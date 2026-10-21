@@ -208,7 +208,9 @@ A single resolver (`qdrantCollectionForSourceKey`) derives the collection from t
 | File type | Bucket | Ingestion capability |
 | --- | --- | --- |
 | PDF | `auraplex-raw-pdf` | `supported` |
-| DOCX | `auraplex-raw-pdf` | `deferred` (stored only) |
+| DOCX, XLSX, PPTX | `auraplex-raw-docs` (DOCX was `auraplex-raw-pdf` before; those objects stay there) | `deferred` (stored only) |
+| DOC, XLS, PPT (97-2003) | `auraplex-raw-docs` | `deferred` (stored only) |
+| CSV, TXT | `auraplex-raw-docs` | `deferred` (stored only) |
 | PNG, JPG/JPEG | `auraplex-raw-image` | `deferred` (stored only) |
 | MP4 | `auraplex-raw-video` | `deferred` (stored only; transcription out of scope) |
 
@@ -251,7 +253,7 @@ Errors use one shape, `{ "ok": false, "code": "…", "error": "…" }`, with no 
 
 ### `GET /api/admin/uploads`
 
-Returns `{ ok: true, uploads: RecentUpload[], qdrantAvailable }` with up to 50 recent uploads across the three buckets. Uploaders see only objects whose `uploaded-by` matches their Keycloak subject; Admins see all. Legacy objects whose `uploaded-by` is an old per-login UUID match no uploader and are visible to Admins only. Because ownership is in object metadata, the listing checks metadata newest-first in batches of 25 until 50 matching objects are found, so other users' newer uploads cannot hide an uploader's own objects. If Qdrant is not configured, `qdrantAvailable` is `false` and PDFs stay `pending`; a Qdrant query error fails the request rather than reporting a false result.
+Returns `{ ok: true, uploads: RecentUpload[], qdrantAvailable }` with up to 50 recent uploads across the four buckets. Uploaders see only objects whose `uploaded-by` matches their Keycloak subject; Admins see all. Legacy objects whose `uploaded-by` is an old per-login UUID match no uploader and are visible to Admins only. Because ownership is in object metadata, the listing checks metadata newest-first in batches of 25 until 50 matching objects are found, so other users' newer uploads cannot hide an uploader's own objects. If Qdrant is not configured, `qdrantAvailable` is `false` and PDFs stay `pending`; a Qdrant query error fails the request rather than reporting a false result.
 
 ### `DELETE /api/admin/uploads`
 
@@ -273,7 +275,7 @@ Admin only, CSRF required, JSON body `{ "bucket": "…", "key": "…" }` (at mos
 - If `CompleteMultipartUpload` fails, lib-storage does not abort by itself, so the adapter sends a best-effort `AbortMultipartUpload` for that `UploadId` in the background (capped at 30 seconds including SDK retries). The request fails immediately with the original completion error; a failing or hung abort cannot replace or delay it. The final object key is never deleted as cleanup, because an existing object may already be stored under it.
 - lib-storage does not cancel part uploads already in flight; up to two 8 MiB parts may remain in memory until they finish or time out.
 - The application **cannot guarantee cleanup** if the process crashes or is killed, if `AbortMultipartUpload` fails or times out, or if a request is cancelled while `CompleteMultipartUpload` is already in progress.
-- **Required operational control:** a MinIO lifecycle rule on `auraplex-raw-pdf`, `auraplex-raw-image` and `auraplex-raw-video` that aborts incomplete multipart uploads after a period chosen and confirmed by ops (longer than the longest legitimate upload). This repository does not set the value, and **the rule has not been confirmed as deployed**. The in-application aborts are best-effort and do not replace it.
+- **Required operational control:** a MinIO lifecycle rule on `auraplex-raw-pdf`, `auraplex-raw-docs`, `auraplex-raw-image` and `auraplex-raw-video` that aborts incomplete multipart uploads after a period chosen and confirmed by ops (longer than the longest legitimate upload). This repository does not set the value, and **the rule has not been confirmed as deployed**. The in-application aborts are best-effort and do not replace it.
 
 ## Status Model
 
@@ -375,14 +377,14 @@ A local HTTP run against the standalone production build with a local S3 sink ex
 
 1. Merge the implementation after review.
 2. Provision runtime variables via the approved Nomad/Vault mechanism; remove `QDRANT_COLLECTION` from templates.
-3. Create the MinIO service account with the documented policy, and configure the incomplete-multipart lifecycle rule on all three buckets.
+3. Create the MinIO service account with the documented policy, and configure the incomplete-multipart lifecycle rule on all four buckets.
 4. Configure the Keycloak client: callback and post-logout URIs, `groups` in the ID token, and SSO session idle/max.
 5. Configure `admin.auraplex.info` routing in Cloudflare Tunnel and APISIX with body-size and timeout limits for the configured maximum.
 6. Deploy to a controlled environment and complete the staging checklist below, including the 500 MB ingress test, before raising `ADMIN_UPLOAD_MAX_MB` above the default.
 
 ### Staging checklist
 
-- Upload representative PDF, DOCX, image and video files; confirm keys, metadata and `source_key`.
+- Upload representative PDF, Office (current and 97-2003), CSV/TXT, image and video files; confirm keys, metadata and `source_key`.
 - Upload a file at the configured maximum through Cloudflare → APISIX → Node, with and without `Content-Length`; confirm bounded memory and no truncation.
 - Reject a file over the maximum.
 - Confirm Keycloak login, logout (with and without discovery), idle/absolute expiry and group changes.
@@ -405,7 +407,7 @@ Resolved during implementation:
 - `product_id` is the catalogue ID; the server derives `product.slug`.
 - Object key `{ingest_line}/{product.slug}/{filename}` and `source_key` `{bucket}/{key}`; no upload-ID filename prefix.
 - Qdrant collections `auraplex_machines`, `auraplex_software`, `auraplex_consulting`.
-- DOCX is stored in `auraplex-raw-pdf` as deferred; images and video are stored now as deferred.
+- Office files, CSV and TXT are stored in `auraplex-raw-docs` as deferred (DOCX was stored in `auraplex-raw-pdf` before); images and video are stored now as deferred.
 - Admin deletion is in scope, Qdrant first; one MinIO credential covers upload and deletion.
 - Keycloak session settings and the 60-second revalidation window (see [Keycloak revalidation](#keycloak-revalidation)).
 
@@ -414,7 +416,7 @@ Still open (require Friendy, infrastructure or real-environment evidence):
 1. **500 MB ingress path.** Cloudflare Tunnel plan body limit (100 MB on Free/Pro, 200 MB on Business, 500 MB default on Enterprise per Cloudflare's documentation), APISIX `client_max_body_size` and timeouts. **Not yet validated.**
 2. **Failed ingestion signal.** No authoritative per-`source_key` failure signal exists; `failed` is not shown until one is defined.
 3. **Same-key stale Qdrant evidence.** Needs an upstream payload field (ETag or `upload-id`) and a replacement/versioning decision. **Not solved.**
-4. **MinIO lifecycle rule** for incomplete multipart uploads on all three buckets, with an ops-confirmed duration. **Not confirmed as deployed.**
+4. **MinIO lifecycle rule** for incomplete multipart uploads on all four buckets, with an ops-confirmed duration. **Not confirmed as deployed.**
 5. Whether the ingest worker's `parse_key()` and payload match the confirmed key and `source_key`, and whether `source_key` has an exact-match payload index in each collection.
 6. The MinIO server version accepts lib-storage multipart uploads with the SDK's default CRC32 checksums.
 7. Keycloak issuer, client, redirect and post-logout URI registration and `groups` claim mapping; and real-realm confirmation of revalidation (ID token with `groups` in the refresh response, Basic client authentication, session-cookie size through the ingress), which has only been tested against a fake Keycloak.

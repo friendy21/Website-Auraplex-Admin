@@ -1,5 +1,12 @@
 import { NextResponse } from 'next/server';
-import { UPLOAD_BUCKETS, uploadMediaForExtension, type DeleteUploadResponse, type UploadBucket, type UploadObjectLocation } from '@/lib/admin/upload-contract';
+import {
+  UPLOAD_BUCKETS,
+  uploadMediaForExtension,
+  uploadMediaStoredIn,
+  type DeleteUploadResponse,
+  type UploadBucket,
+  type UploadObjectLocation,
+} from '@/lib/admin/upload-contract';
 import { UploadContractError, normalizeUploadError } from '@/lib/admin/upload-errors';
 import { sanitizeUploadFilename } from '@/lib/admin/upload-validation';
 import { parseUploadObjectKey } from '@/lib/admin/object-key';
@@ -50,7 +57,7 @@ export function validateDeleteTarget(input: unknown): UploadObjectLocation {
   }
   const extension = safeFilename.split('.').pop() ?? '';
   const media = uploadMediaForExtension(extension);
-  if (!media || media.bucket !== bucket) {
+  if (!media || !uploadMediaStoredIn(media, bucket)) {
     throw new UploadContractError(400, 'MALFORMED_REQUEST', 'Object type does not match bucket');
   }
   const location = { bucket: bucket as UploadBucket, key };

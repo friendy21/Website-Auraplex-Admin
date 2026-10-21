@@ -42,6 +42,7 @@ import {
 } from '@/lib/admin/server/rate-limit';
 import {
   createStorageAdapter,
+  isMissingBucketError,
   type StorageAdapter,
   type StoredObject,
 } from '@/lib/admin/server/storage';
@@ -178,6 +179,13 @@ export async function putUpload(
         [UPLOAD_METADATA.ingestionCapability]: prepared.media.ingestionCapability,
         [UPLOAD_METADATA.uploadedBy]: encodeURIComponent(identity.userId),
       },
+    }).catch((error: unknown) => {
+      if (!isMissingBucketError(error)) throw error;
+      throw new UploadContractError(
+        503,
+        'BACKEND_NOT_CONFIGURED',
+        `Storage bucket ${prepared.location.bucket} does not exist; uploads of this file type are not available yet`,
+      );
     });
 
     const receivedBytes = counter.receivedBytes;
@@ -252,7 +260,13 @@ export async function getUploads(
     const stored = (
       await Promise.all(
         UPLOAD_BUCKETS.map((bucket) =>
-          storage.listObjects(bucket, { limit: RECENT_UPLOAD_LIMIT, filter: visible }),
+          storage.listObjects(bucket, { limit: RECENT_UPLOAD_LIMIT, filter: visible }).catch((error: unknown) => {
+            // A bucket that does not exist yet holds no uploads, and must not
+            // hide the uploads in all the others.
+            if (!isMissingBucketError(error)) throw error;
+            console.warn(JSON.stringify({ type: 'admin_storage', outcome: 'bucket-missing', bucket }));
+            return [];
+          }),
         ),
       )
     )

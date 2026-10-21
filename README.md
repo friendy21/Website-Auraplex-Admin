@@ -1,7 +1,7 @@
 # Auraplex Admin
 
 Restricted internal workspace for uploading knowledge-base source material
-(PDF, DOCX, PNG, JPG/JPEG, MP4) for Auraplex products. Staff sign in with
+(PDF; Word, Excel and PowerPoint (DOCX, XLSX, PPTX and the 97-2003 DOC, XLS, PPT); CSV and TXT; PNG, JPG/JPEG; MP4) for Auraplex products. Staff sign in with
 Authentik, pick a business line and a product, and upload files. Files are
 stored in MinIO; the workspace also shows each upload's processing status
 from Qdrant and lets Admins delete an upload from both systems.
@@ -91,7 +91,10 @@ can be uploaded to them; add real records only, never placeholders.
 
 - Object key: `{ingest_line}/{product.slug}/{sanitized_filename}`
 - Qdrant `source_key`: `{bucket}/{key}`
-- Buckets: `auraplex-raw-pdf`, `auraplex-raw-image`, `auraplex-raw-video`
+- Buckets: `auraplex-raw-pdf` (PDF), `auraplex-raw-docs` (Word, Excel,
+  PowerPoint, CSV, TXT), `auraplex-raw-image`, `auraplex-raw-video`. DOCX
+  uploaded before `auraplex-raw-docs` existed stays in `auraplex-raw-pdf`,
+  where it is still listed and can be deleted.
 
 ## Authentik requirements
 
@@ -122,7 +125,9 @@ live checks.
 ## MinIO and Qdrant requirements
 
 - **MinIO**: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, optional
-  `MINIO_REGION`. The three buckets above must exist. The access key needs
+  `MINIO_REGION`. The four buckets above must exist (until
+  `auraplex-raw-docs` does, uploads of its types answer 503 and the upload
+  list skips it with an `admin_storage` / `bucket-missing` warning). The access key needs
   the permissions in `docs/deployment/minio-admin-upload-policy.json`.
 - **Qdrant**: `QDRANT_URL` and, if the deployment requires one,
   `QDRANT_API_KEY`. Used for status lookup and delete only. Collections are

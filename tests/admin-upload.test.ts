@@ -40,14 +40,63 @@ const PNG_BYTES = new Uint8Array([
 ]);
 const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0]);
 const MP4_BYTES = new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0]);
-const DOCX_BYTES = (() => {
-  const filename = new TextEncoder().encode('word/document.xml');
+/** A zip whose first entry is `name`: what file-type reads to tell DOCX, XLSX and PPTX apart. */
+function zipStartingWith(name: string): Uint8Array<ArrayBuffer> {
+  const filename = new TextEncoder().encode(name);
   const bytes = new Uint8Array(30 + filename.byteLength);
   bytes.set([0x50, 0x4b, 0x03, 0x04], 0);
   bytes[26] = filename.byteLength;
   bytes.set(filename, 30);
   return bytes;
-})();
+}
+const DOCX_BYTES = zipStartingWith('word/document.xml');
+const XLSX_BYTES = zipStartingWith('xl/workbook.xml');
+const PPTX_BYTES = zipStartingWith('ppt/presentation.xml');
+
+/**
+ * A Microsoft Compound File (the Office 97-2003 container): its signature,
+ * and a directory entry for `stream` (UTF-16LE name, NUL-terminated) at
+ * `nameOffset`, past the sniffed window by default.
+ */
+function compoundFile(stream: string, nameOffset = 7_995, size = 9_000): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(size).fill(0xff);
+  bytes.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1], 0);
+  bytes.set(Buffer.from(`${stream}\0`, 'utf16le'), nameOffset);
+  return bytes;
+}
+
+function chunked(bytes: Uint8Array, chunkSize: number): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let index = 0; index < bytes.byteLength; index += chunkSize) {
+        controller.enqueue(bytes.slice(index, index + chunkSize));
+      }
+      controller.close();
+    },
+  });
+}
+
+/** Everything the stream delivers, and the error it ends with, if any. */
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<{ bytes: Uint8Array; error?: unknown }> {
+  const parts: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return { bytes: new Uint8Array(Buffer.concat(parts)) };
+      parts.push(value);
+    }
+  } catch (error) {
+    return { bytes: new Uint8Array(Buffer.concat(parts)), error };
+  }
+}
+
+function isMimeMismatch(error: unknown): boolean {
+  assert.ok(error instanceof UploadContractError, String(error));
+  assert.equal(error.code, 'MIME_MISMATCH');
+  assert.equal(error.status, 415);
+  return true;
+}
 
 function expectContractError(
   callback: () => unknown,
@@ -151,13 +200,28 @@ test('rejects path traversal and control characters', () => {
 
 test('routes supported MIME types to the specified buckets', () => {
   assert.equal(resolveUploadMedia('application/pdf', 'manual.pdf').bucket, 'auraplex-raw-pdf');
-  assert.equal(
-    resolveUploadMedia(
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'manual.docx',
-    ).bucket,
-    'auraplex-raw-pdf',
+  for (const [mime, filename] of [
+    ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'manual.docx'],
+    ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'prices.xlsx'],
+    ['application/vnd.openxmlformats-officedocument.presentationml.presentation', 'deck.pptx'],
+    ['application/msword', 'manual.doc'],
+    ['application/vnd.ms-excel', 'prices.xls'],
+    ['application/vnd.ms-powerpoint', 'deck.ppt'],
+    ['text/csv', 'prices.csv'],
+    ['text/plain', 'notes.txt'],
+  ]) {
+    const media = resolveUploadMedia(mime, filename);
+    assert.equal(media.bucket, 'auraplex-raw-docs', filename);
+    assert.equal(media.ingestionCapability, 'deferred', filename);
+  }
+  // DOCX was stored with the PDFs before documents had their own bucket.
+  assert.deepEqual(
+    resolveUploadMedia('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'manual.docx').legacyBuckets,
+    ['auraplex-raw-pdf'],
   );
+  // A spreadsheet's MIME type does not make a CSV, nor a text type an XLSX.
+  expectContractError(() => resolveUploadMedia('application/vnd.ms-excel', 'prices.csv'), 'UNSUPPORTED_MEDIA_TYPE', 415);
+  expectContractError(() => resolveUploadMedia('text/plain', 'prices.xlsx'), 'UNSUPPORTED_MEDIA_TYPE', 415);
   assert.equal(resolveUploadMedia('image/jpeg', 'photo.jpg').bucket, 'auraplex-raw-image');
   assert.equal(resolveUploadMedia('image/png', 'photo.png').bucket, 'auraplex-raw-image');
   assert.equal(resolveUploadMedia('video/mp4', 'demo.mp4').bucket, 'auraplex-raw-video');
@@ -354,6 +418,8 @@ test('sniffs every accepted signature and preserves every stream byte', async ()
   const cases = [
     { bytes: PDF_BYTES, mime: 'application/pdf', filename: 'manual.pdf' },
     { bytes: DOCX_BYTES, mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename: 'manual.docx' },
+    { bytes: XLSX_BYTES, mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', filename: 'prices.xlsx' },
+    { bytes: PPTX_BYTES, mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', filename: 'deck.pptx' },
     { bytes: PNG_BYTES, mime: 'image/png', filename: 'diagram.png' },
     { bytes: JPEG_BYTES, mime: 'image/jpeg', filename: 'photo.jpg' },
     { bytes: MP4_BYTES, mime: 'video/mp4', filename: 'demo.mp4' },
@@ -379,7 +445,7 @@ test('sniffs every accepted signature and preserves every stream byte', async ()
       if (done) break;
       received.push(...value);
     }
-    assert.equal(sniffed.detected.mime, item.mime);
+    assert.equal(sniffed.detected?.mime, item.mime);
     assert.deepEqual(received, Array.from(item.bytes));
   }
 });
@@ -450,6 +516,95 @@ test('rejects MIME spoofing and unsupported binary content', async () => {
       return true;
     },
   );
+});
+
+test('Office Open XML files must be the type their extension names', async () => {
+  for (const [bytes, mime, filename] of [
+    [XLSX_BYTES, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'manual.docx'],
+    [DOCX_BYTES, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'prices.xlsx'],
+    [zipStartingWith('docProps/app.xml'), 'application/vnd.openxmlformats-officedocument.presentationml.presentation', 'deck.pptx'],
+  ] as const) {
+    await assert.rejects(sniffUploadStream(new Blob([bytes]).stream(), resolveUploadMedia(mime, filename)), isMimeMismatch, filename);
+  }
+});
+
+test('legacy Office files are told apart by the stream their compound file holds', async () => {
+  for (const { filename, mime, stream } of [
+    { filename: 'manual.doc', mime: 'application/msword', stream: 'WordDocument' },
+    { filename: 'prices.xls', mime: 'application/vnd.ms-excel', stream: 'Workbook' },
+    { filename: 'prices-95.xls', mime: 'application/vnd.ms-excel', stream: 'Book' },
+    { filename: 'deck.ppt', mime: 'application/vnd.ms-powerpoint', stream: 'PowerPoint Document' },
+  ]) {
+    const bytes = compoundFile(stream);
+    // 1,000-byte chunks split the directory name across two chunks.
+    const sniffed = await sniffUploadStream(chunked(bytes, 1_000), resolveUploadMedia(mime, filename));
+    assert.equal(sniffed.detected?.mime, 'application/x-cfb', filename);
+    const received = await readAll(sniffed.stream);
+    assert.equal(received.error, undefined, filename);
+    assert.deepEqual(received.bytes, bytes, filename);
+  }
+});
+
+test("a compound file without the declared type's stream never reaches storage whole", async () => {
+  const doc = resolveUploadMedia('application/msword', 'manual.doc');
+  // An Excel workbook named .doc, and a compound file of no Office type (e.g. an installer).
+  for (const bytes of [compoundFile('Workbook'), compoundFile('SummaryInformation')]) {
+    const sniffed = await sniffUploadStream(chunked(bytes, 1_000), doc);
+    const received = await readAll(sniffed.stream);
+    assert.ok(isMimeMismatch(received.error));
+    assert.equal(received.bytes.byteLength, 8_000, 'the last chunk was held back until the check failed');
+  }
+  // A file that already ended within the inspected window is refused before anything is streamed.
+  await assert.rejects(sniffUploadStream(new Blob([compoundFile('Workbook', 600, 2_000)]).stream(), doc), isMimeMismatch);
+  // Not a compound file at all.
+  await assert.rejects(sniffUploadStream(new Blob([DOCX_BYTES]).stream(), doc), isMimeMismatch);
+});
+
+test('CSV and TXT accept text in any 8-bit encoding, or UTF-16 with a byte-order mark', async () => {
+  const csv = resolveUploadMedia('text/csv', 'prices.csv');
+  const txt = resolveUploadMedia('text/plain', 'notes.txt');
+  const utf16 = Buffer.from('Name\tWert\r\nRolle\t3\r\n', 'utf16le');
+  const long = Buffer.from('product;price\n'.repeat(1_000));
+  for (const { name, media, bytes } of [
+    { name: 'UTF-8 with BOM', media: csv, bytes: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('Größe;Preis\r\n12;3,50 €\r\n')]) },
+    { name: 'Windows-1252', media: csv, bytes: Buffer.from('caf\xe9;1\r\n', 'latin1') },
+    { name: 'past the inspected window', media: csv, bytes: long },
+    { name: 'UTF-16LE with BOM', media: txt, bytes: Buffer.concat([Buffer.from([0xff, 0xfe]), utf16]) },
+    { name: 'UTF-16BE with BOM', media: txt, bytes: Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(utf16).swap16()]) },
+    { name: 'one byte', media: txt, bytes: Buffer.from('a') },
+  ]) {
+    // One-byte chunks also split the byte-order mark and every UTF-16 code unit.
+    for (const chunkSize of [1, 1_000]) {
+      const sniffed = await sniffUploadStream(chunked(new Uint8Array(bytes), chunkSize), media);
+      assert.equal(sniffed.detected, null, name);
+      const received = await readAll(sniffed.stream);
+      assert.equal(received.error, undefined, `${name} (${chunkSize})`);
+      assert.deepEqual(received.bytes, new Uint8Array(bytes), `${name} (${chunkSize})`);
+    }
+  }
+});
+
+test('CSV and TXT refuse binary content, also after the inspected window', async () => {
+  const csv = resolveUploadMedia('text/csv', 'prices.csv');
+  const utf16 = Buffer.from('Name\tWert', 'utf16le');
+  for (const [name, bytes] of [
+    ['PNG named .csv', PNG_BYTES],
+    ['XLSX named .csv', XLSX_BYTES],
+    ['UTF-16 without byte-order mark', utf16],
+    ['UTF-16 with an odd number of bytes', Buffer.concat([Buffer.from([0xff, 0xfe]), utf16, Buffer.from('x')])],
+    ['UTF-16 control character', Buffer.concat([Buffer.from([0xff, 0xfe]), utf16, Buffer.from([0x01, 0x00])])],
+  ] as const) {
+    await assert.rejects(sniffUploadStream(new Blob([new Uint8Array(bytes)]).stream(), csv), isMimeMismatch, name);
+  }
+
+  // Text for the first 9,500 bytes, then a NUL: refused when that chunk
+  // arrives, and that chunk is not forwarded.
+  const late = new Uint8Array(Buffer.from('product;price\n'.repeat(800)).subarray(0, 10_000));
+  late[9_500] = 0;
+  const sniffed = await sniffUploadStream(chunked(late, 1_000), csv);
+  const received = await readAll(sniffed.stream);
+  assert.ok(isMimeMismatch(received.error));
+  assert.equal(received.bytes.byteLength, 9_000);
 });
 
 test('Content-Length is optional but validated when present', () => {

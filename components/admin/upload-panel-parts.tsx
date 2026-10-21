@@ -105,7 +105,7 @@ export function FileDropzone({ onFiles }: {
           <UploadCloud aria-hidden="true" className="h-6 w-6" />
         </div>
         <p className="mt-5 font-display text-2xl font-semibold">Drop source files here</p>
-        <p className="mt-2 text-sm text-[color:var(--color-neutral-400)]">PDF, DOCX, PNG, JPG or MP4</p>
+        <p className="mt-2 text-sm text-[color:var(--color-neutral-400)]">PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX, CSV, TXT, PNG, JPG or MP4</p>
         <button type="button" onClick={open} className="mt-5 font-mono text-xs uppercase tracking-[0.16em] text-[color:var(--color-signal)] underline decoration-[color:var(--color-signal)]/50 underline-offset-4 hover:text-[color:var(--color-signal-bright)]">
           Browse files
         </button>

@@ -47,7 +47,7 @@ Authentik, MinIO, Qdrant, APISIX, Cloudflare Tunnel or Nomad.**
   does not succeed depends on why; see
   [Re-verification outcomes](#re-verification-outcomes).
 - **Upload contract.** Object key `{ingest_line}/{product.slug}/{sanitized_filename}`,
-  Qdrant `source_key` `{bucket}/{key}`, three fixed buckets and three fixed
+  Qdrant `source_key` `{bucket}/{key}`, four fixed buckets and three fixed
   collections. See the README.
 - **Container image.** `Dockerfile` builds the Next.js standalone server on
   `node:22-slim`, needs no secrets at build time, and runs as the unprivileged
@@ -300,8 +300,16 @@ reach is a separate, unresolved question; see [section E](#e-unresolved).
 
 - The MinIO access key needs the permissions in
   [minio-admin-upload-policy.json](minio-admin-upload-policy.json) on
-  `auraplex-raw-pdf`, `auraplex-raw-image` and `auraplex-raw-video`.
-- An incomplete-multipart lifecycle rule should exist on all three buckets.
+  `auraplex-raw-pdf`, `auraplex-raw-docs`, `auraplex-raw-image` and
+  `auraplex-raw-video`.
+- **New with documents and spreadsheets:** create `auraplex-raw-docs`, add it
+  to the access key's policy (the JSON above already lists it) and to the
+  incomplete-multipart lifecycle rule. Until then, Word/Excel/PowerPoint/CSV/TXT
+  uploads answer 503 `BACKEND_NOT_CONFIGURED`, the upload list leaves the
+  bucket out (logged as `admin_storage` / `bucket-missing`), and PDF, image and
+  video uploads are unaffected. Existing DOCX objects stay in
+  `auraplex-raw-pdf`; nothing has to be moved.
+- An incomplete-multipart lifecycle rule should exist on all four buckets.
 - Qdrant must allow read and delete on `auraplex_machines`,
   `auraplex_software` and `auraplex_consulting`.
 
@@ -439,7 +447,7 @@ now the registered Authentik one, and the production upload cap of 300 MB.
 | 1 | Ingress limits for the 300 MB upload cap | The cap itself is decided: 300 MB, set as `ADMIN_UPLOAD_MAX_MB` in the job. Not verified: that APISIX and Cloudflare pass request bodies of at least that size. Cloudflare's request-body limit depends on the plan; see the [runtime notes](AURA-INT-001-runtime.md). |
 | 2 | Nomad injection of `AUTHENTIK_CLIENT_SECRET` | Source confirmed: Nomad variable `nomad/jobs/admin-upload`, field `keycloak_client_secret`, injected by the deployed job (Friendy's). Since AURA-INT-002 that job must render the field as `AUTHENTIK_CLIENT_SECRET`, and set `AUTHENTIK_ISSUER` and `AUTHENTIK_CLIENT_ID` instead of the `KEYCLOAK_*` names. Not in this draft. |
 | 3 | `AUTH_SECRET` | Value and source not supplied. |
-| 4 | MinIO endpoint, access key and secret key | Not supplied. The three buckets must exist and the key needs the documented policy. |
+| 4 | MinIO endpoint, access key and secret key | Not supplied. The four buckets must exist and the key needs the documented policy. |
 | 5 | Qdrant URL and, if required, API key | Not supplied. |
 | 6 | APISIX route definitions | Not in this repository. |
 | 7 | Cloudflare Tunnel ID and configuration | Not in this repository. |

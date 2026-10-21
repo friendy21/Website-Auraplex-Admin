@@ -323,13 +323,45 @@ test('GET and DELETE independently reject missing sessions', async () => {
   assert.equal((await deleteUpload(deleteRequest(), deleteDependencies({ authenticate: anonymous, storage: () => storage }))).status, 401);
 });
 
+/** A zip whose first entry is `name`, as file-type identifies DOCX, XLSX and PPTX. */
+function zipStartingWith(name: string): Uint8Array {
+  const filename = new TextEncoder().encode(name);
+  const bytes = new Uint8Array(30 + filename.byteLength);
+  bytes.set([0x50, 0x4b, 0x03, 0x04], 0);
+  bytes[26] = filename.byteLength;
+  bytes.set(filename, 30);
+  return bytes;
+}
+
+/** An Office 97-2003 compound file whose directory names `stream`, past the sniffed window. */
+function compoundFile(stream: string, size = 9_000): Uint8Array {
+  const bytes = new Uint8Array(size).fill(0xff);
+  bytes.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1], 0);
+  bytes.set(Buffer.from(`${stream}\0`, 'utf16le'), size - 1_005);
+  return bytes;
+}
+
+function typedUploadRequest(filename: string, mime: string, bytes: Uint8Array) {
+  return new Request('http://localhost/api/admin/uploads', {
+    method: 'PUT', body: bytes.slice().buffer,
+    headers: {
+      'content-length': String(bytes.length), 'content-type': mime,
+      'x-csrf-token': 'test', 'x-product-id': '6470625', 'x-product-line': 'labelling',
+      'x-upload-filename': encodeURIComponent(filename),
+    },
+  });
+}
+
 test('accepted non-PDF files are stored and remain pending', async () => {
-  const docx = new Uint8Array(30 + 17);
-  docx.set([0x50, 0x4b, 0x03, 0x04], 0);
-  docx[26] = 17;
-  docx.set(new TextEncoder().encode('word/document.xml'), 30);
   const cases = [
-    { name: 'manual.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', bytes: docx, bucket: 'auraplex-raw-pdf' },
+    { name: 'manual.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', bytes: zipStartingWith('word/document.xml'), bucket: 'auraplex-raw-docs' },
+    { name: 'prices.xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', bytes: zipStartingWith('xl/workbook.xml'), bucket: 'auraplex-raw-docs' },
+    { name: 'deck.pptx', mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', bytes: zipStartingWith('ppt/presentation.xml'), bucket: 'auraplex-raw-docs' },
+    { name: 'manual.doc', mime: 'application/msword', bytes: compoundFile('WordDocument'), bucket: 'auraplex-raw-docs' },
+    { name: 'prices.xls', mime: 'application/vnd.ms-excel', bytes: compoundFile('Workbook'), bucket: 'auraplex-raw-docs' },
+    { name: 'deck.ppt', mime: 'application/vnd.ms-powerpoint', bytes: compoundFile('PowerPoint Document'), bucket: 'auraplex-raw-docs' },
+    { name: 'prices.csv', mime: 'text/csv', bytes: new TextEncoder().encode('product;price\nflexy;3,50\n'), bucket: 'auraplex-raw-docs' },
+    { name: 'notes.txt', mime: 'text/plain', bytes: new TextEncoder().encode('Maintenance notes\n'), bucket: 'auraplex-raw-docs' },
     { name: 'diagram.png', mime: 'image/png', bytes: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]), bucket: 'auraplex-raw-image' },
     { name: 'photo.jpg', mime: 'image/jpeg', bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0]), bucket: 'auraplex-raw-image' },
     { name: 'demo.mp4', mime: 'video/mp4', bytes: new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0]), bucket: 'auraplex-raw-video' },
@@ -341,20 +373,79 @@ test('accepted non-PDF files are stored and remain pending', async () => {
       async listObjects() { return []; },
       async deleteObject() {},
     };
-    const request = new Request('http://localhost/api/admin/uploads', {
-      method: 'PUT', body: item.bytes.slice().buffer,
-      headers: {
-        'content-length': String(item.bytes.length), 'content-type': item.mime,
-        'x-csrf-token': 'test', 'x-product-id': '6470625', 'x-product-line': 'labelling',
-        'x-upload-filename': encodeURIComponent(item.name),
-      },
-    });
-    const response = await putUpload(request, dependencies(storage));
+    const response = await putUpload(typedUploadRequest(item.name, item.mime, item.bytes), dependencies(storage));
     assert.equal(response.status, 200, item.name);
-    assert.equal((await response.json()).status, 'pending');
+    const body = await response.json();
+    assert.equal(body.status, 'pending');
+    assert.equal(body.key, `machines/flexy-applicator/${item.name}`);
     assert.equal(saved?.bucket, item.bucket);
+    assert.equal(saved?.contentType, item.mime, item.name);
     assert.equal(saved?.metadata[UPLOAD_METADATA.ingestionCapability], 'deferred');
   }
+});
+
+test('content that is not the declared document type is 415 and storage never gets the whole file', async () => {
+  for (const item of [
+    // A workbook named .doc: the compound-file check fails at the end of the file.
+    { name: 'manual.doc', mime: 'application/msword', bytes: compoundFile('Workbook') },
+    // A binary file named .csv, and text with binary content after the inspected window.
+    { name: 'prices.csv', mime: 'text/csv', bytes: zipStartingWith('xl/workbook.xml') },
+    { name: 'notes.txt', mime: 'text/plain', bytes: Uint8Array.from([...new TextEncoder().encode('a'.repeat(6_000)), 0, 0x61]) },
+  ]) {
+    let stored = 0;
+    const response = await putUpload(
+      typedUploadRequest(item.name, item.mime, item.bytes),
+      dependencies(drainingStorage((_input, bytes) => { stored = bytes; })),
+    );
+    assert.equal(response.status, 415, item.name);
+    assert.equal((await response.json()).code, 'MIME_MISMATCH', item.name);
+    assert.ok(stored < item.bytes.byteLength, `${item.name}: not stored complete`);
+  }
+});
+
+test('the documents bucket not existing yet: its uploads are 503, the listing keeps the other buckets', async () => {
+  const missing = Object.assign(new Error('The specified bucket does not exist'), { name: 'NoSuchBucket' });
+  const pdf = {
+    bucket: 'auraplex-raw-pdf' as const,
+    key: 'machines/flexy-applicator/manual.pdf',
+    size: 10,
+    lastModified: new Date('2026-10-20T10:00:00Z'),
+    metadata: { 'upload-id': 'pdf-id', 'uploaded-by': 'user-1' },
+  };
+  const listed: string[] = [];
+  const storage: StorageAdapter = {
+    async putObject(input) {
+      for await (const _chunk of input.body) { /* drain */ }
+      if (input.bucket === 'auraplex-raw-docs') throw missing;
+      return {};
+    },
+    async listObjects(bucket) {
+      listed.push(bucket);
+      if (bucket === 'auraplex-raw-docs') throw missing;
+      return bucket === 'auraplex-raw-pdf' ? [pdf] : [];
+    },
+    async deleteObject() {},
+  };
+  const warn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (line: string) => { warnings.push(line); };
+  try {
+    const upload = await putUpload(typedUploadRequest('notes.txt', 'text/plain', new TextEncoder().encode('notes\n')), dependencies(storage));
+    assert.equal(upload.status, 503);
+    assert.equal((await upload.json()).code, 'BACKEND_NOT_CONFIGURED');
+
+    const list = await getUploads(new Request('http://localhost/api/admin/uploads'), dependencies(storage));
+    assert.equal(list.status, 200);
+    assert.deepEqual((await list.json()).uploads.map((item: { uploadId: string }) => item.uploadId), ['pdf-id']);
+    assert.deepEqual(listed.sort(), ['auraplex-raw-docs', 'auraplex-raw-image', 'auraplex-raw-pdf', 'auraplex-raw-video']);
+    assert.deepEqual(warnings.map((line) => JSON.parse(line)), [{ type: 'admin_storage', outcome: 'bucket-missing', bucket: 'auraplex-raw-docs' }]);
+  } finally {
+    console.warn = warn;
+  }
+
+  // Any other storage failure still fails the listing.
+  const broken: StorageAdapter = { ...storage, async listObjects() { throw new Error('connection reset'); } };
+  assert.equal((await getUploads(new Request('http://localhost/api/admin/uploads'), dependencies(broken))).status, 500);
 });
 
 test('browser cancellation is propagated to the storage adapter', async () => {
@@ -756,12 +847,32 @@ test('Admin delete removes exact Qdrant source before the MinIO object', async (
 test('delete validation accepts every ingest prefix without consulting the catalogue', () => {
   for (const [bucket, key] of [
     ['auraplex-raw-pdf', 'machines/flexy-applicator/manual.pdf'],
+    ['auraplex-raw-docs', 'machines/flexy-applicator/manual.docx'],
+    ['auraplex-raw-docs', 'software/future-product/prices.xlsx'],
+    ['auraplex-raw-docs', 'consulting/future-service/notes.txt'],
+    // DOCX stored with the PDFs before documents had their own bucket.
+    ['auraplex-raw-pdf', 'machines/flexy-applicator/old-manual.docx'],
     ['auraplex-raw-image', 'software/future-product/diagram.png'],
     ['auraplex-raw-video', 'consulting/future-service/demo.mp4'],
     // Product removed from today's catalogue: the stored object stays deletable.
     ['auraplex-raw-pdf', 'machines/discontinued-machine/manual.pdf'],
   ] as const) {
     assert.deepEqual(validateDeleteTarget({ bucket, key }), { bucket, key, sourceKey: `${bucket}/${key}` });
+  }
+});
+
+test('delete rejects a type outside its bucket', () => {
+  for (const [bucket, key] of [
+    // Only DOCX was ever stored with the PDFs.
+    ['auraplex-raw-pdf', 'machines/flexy-applicator/prices.xlsx'],
+    ['auraplex-raw-docs', 'machines/flexy-applicator/manual.pdf'],
+    ['auraplex-raw-image', 'machines/flexy-applicator/notes.csv'],
+  ] as const) {
+    assert.throws(() => validateDeleteTarget({ bucket, key }), (error: unknown) => {
+      assert.ok(error instanceof UploadContractError);
+      assert.equal(error.code, 'MALFORMED_REQUEST');
+      return true;
+    }, `${bucket}/${key}`);
   }
 });
 

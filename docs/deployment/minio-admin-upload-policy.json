@@ -9,6 +9,7 @@
       ],
       "Resource": [
         "arn:aws:s3:::auraplex-raw-pdf",
+        "arn:aws:s3:::auraplex-raw-docs",
         "arn:aws:s3:::auraplex-raw-image",
         "arn:aws:s3:::auraplex-raw-video"
       ]
@@ -24,6 +25,7 @@
       ],
       "Resource": [
         "arn:aws:s3:::auraplex-raw-pdf/*",
+        "arn:aws:s3:::auraplex-raw-docs/*",
         "arn:aws:s3:::auraplex-raw-image/*",
         "arn:aws:s3:::auraplex-raw-video/*"
       ]
